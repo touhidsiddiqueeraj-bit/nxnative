@@ -89,6 +89,7 @@ pyright	dm/tools/gpuprof.py	reportOptionalMemberAccess	1	"split" is not a known 
 pyright	dm/tools/make_ext_font.py	reportOptionalSubscript	1	Object of type "None" is not subscriptable
 pyright	dm/tools/nro_collect.py	reportMissingImports	1	Import "backports" could not be resolved
 pyright	dm/tools/nro_collect.py	reportOptionalIterable	1	Object of type "None" cannot be used as iterable value
+pyright	dm/tools/nso_fnmap.py	reportMissingImports	1	Import "numpy" could not be resolved
 pyright	dm/tools/nvn_slots_got.py	reportOperatorIssue	1	Operator "+=" not supported for types "int | None" and "int" Operator "+" not supported for types "None" and "int"
 pyright	dm/tools/nvn_slots_got.py	reportOptionalOperand	2	Operator "+" not supported for "None"
 pyright	dm/tools/patch_nso.py	reportArgumentType	1	Argument of type "ModuleSpec | None" cannot be assigned to parameter "spec" of type "ModuleSpec" in function "module_from_spec" Type "ModuleSpec | None" is not assignable to type "ModuleSpec" "None" is not assignable to "ModuleSpec"
