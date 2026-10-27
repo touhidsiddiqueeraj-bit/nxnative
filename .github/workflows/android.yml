@@ -62,11 +62,14 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # ubuntu-latest preinstalls the Android SDK (ANDROID_HOME, cmdline-tools on PATH); the
+      # ubuntu-latest preinstalls the Android SDK (ANDROID_HOME is set, cmdline-tools inside); the
       # setup-android action's own "sdkmanager tools" step breaks on current runners (the legacy
       # 'tools' package left the repository), so the workflow only adds what it needs:
       - name: Install the NDK and CMake
-        run: sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1" >/dev/null
+        run: |
+          SM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" --install "ndk;26.3.11579264" "cmake;3.22.1" >/dev/null
       - name: Gradle (assembleDebug; the host compiles for profile ${{ env.GAME }})
         working-directory: dm/android
         run: |
@@ -93,10 +96,13 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # ubuntu-latest preinstalls the Android SDK (ANDROID_HOME, cmdline-tools on PATH), as the build
-      # job's comment says; the wrapper brings its own Gradle
+      # ubuntu-latest preinstalls the Android SDK (ANDROID_HOME is set), as the build job's comment
+      # says; the wrapper brings its own Gradle
       - name: Install the NDK, CMake and the build tools
-        run: sdkmanager --install "ndk;26.3.11579264" "cmake;3.22.1" "build-tools;34.0.0" >/dev/null
+        run: |
+          SM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SM" --licenses >/dev/null 2>&1 || true
+          "$SM" --install "ndk;26.3.11579264" "cmake;3.22.1" "build-tools;34.0.0" >/dev/null
       - name: Gradle (assembleRelease; the host compiles for profile ${{ env.GAME }})
         working-directory: dm/android
         run: |
