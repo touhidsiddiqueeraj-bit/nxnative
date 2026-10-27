@@ -5,6 +5,7 @@
     <string name="reset_footer">Brings back all settings this game was tested with.</string>
     <string name="memory_available">Memory available</string>
     <string name="no_game_files">Game files not found.\nPack an APK with scripts/build_apk_from_nsp.py and install it again.</string>
+    <string name="load_failed">The host library did not load:\n%1$s</string>
     <string name="save_failed_title">Save failed</string>
     <string name="save_failed_enospc">Storage is full, so progress was not saved. Free up space and save again.</string>
     <string name="save_failed_fmt">Saving failed (errno %1$d); progress was not saved.</string>

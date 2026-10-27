@@ -3,6 +3,8 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+import java.util.Properties
+
 // The packed game's identity comes in as Gradle properties (dm/android/tools/build_apk.sh sets them;
 // a bare build without them makes the empty shell - what the CI workflow ships as the template)
 val appId = (findProperty("DM_APP_ID") as String?) ?: "org.nxnative.shell"
@@ -14,6 +16,28 @@ android {
     namespace = "org.nxnative.android"
     compileSdk = 34
     ndkVersion = "26.3.11579264"
+
+    // The release key, when the machine has one: dm/android/keystore.properties (git-ignored):
+    //   storeFile=<path to the .keystore, absolute or relative to that properties file>
+    //   storePassword=... / keyAlias=... / keyPassword=...
+    // With it, assembleRelease comes out signed (app-release.apk); without it the build stays
+    // unsigned (app-release-unsigned.apk) - what the CI workflow signs its own way
+    val ks = File(rootProject.projectDir, "keystore.properties")
+    if (ks.exists()) {
+        val p = Properties().apply { ks.inputStream().use { load(it) } }
+        val store = p.getProperty("storeFile").let { f -> File(f).let { if (it.isAbsolute) it else File(ks.parentFile, f) } }
+        signingConfigs {
+            create("release") {
+                storeFile = store
+                storePassword = p.getProperty("storePassword")
+                keyAlias = p.getProperty("keyAlias")
+                keyPassword = p.getProperty("keyPassword")
+            }
+        }
+        buildTypes.matching { it.name == "release" }.configureEach {
+            signingConfig = signingConfigs.getByName("release")
+        }
+    }
 
     defaultConfig {
         applicationId = appId

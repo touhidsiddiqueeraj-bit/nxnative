@@ -79,6 +79,23 @@ jobs:
         run: |
           test -f dm/android/app/build/outputs/apk/debug/app-debug.apk
           unzip -l dm/android/app/build/outputs/apk/debug/app-debug.apk | grep libdmhost.so
+          # 16 KB-page devices (Android 15 in 16 KB mode, Android 16 defaults) load the library
+          # straight from the APK: the ELF's LOAD segments align to 16 KB (jni/CMakeLists.txt) and
+          # the zip entry sits at a 16 KB boundary - both checked here so no artifact regresses
+          python3 - <<'EOF'
+          import struct, zipfile
+          apk = 'dm/android/app/build/outputs/apk/debug/app-debug.apk'
+          z = zipfile.ZipFile(apk); i = z.getinfo('lib/arm64-v8a/libdmhost.so')
+          with open(apk, 'rb') as f:
+              f.seek(i.header_offset); hdr = f.read(30)
+          nlen, elen = struct.unpack('<HH', hdr[26:30])
+          assert (i.header_offset + 30 + nlen + elen) % 16384 == 0, 'libdmhost.so not at a 16 KB boundary'
+          data = z.read('lib/arm64-v8a/libdmhost.so')
+          phoff = struct.unpack_from('<Q', data, 0x20)[0]; esz, num = struct.unpack_from('<HH', data, 0x36)
+          aligns = [struct.unpack_from('<Q', data, phoff + k * esz + 0x30)[0] for k in range(num)
+                    if struct.unpack_from('<I', data, phoff + k * esz)[0] == 1]
+          assert aligns and all(a >= 16384 for a in aligns), f'PT_LOAD alignment below 16 KB: {aligns}'
+          EOF
       - uses: actions/upload-artifact@v4
         with:
           name: nxnative-android-debug
@@ -102,12 +119,17 @@ jobs:
         run: |
           SM=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
           yes | "$SM" --licenses >/dev/null 2>&1 || true
-          "$SM" --install "ndk;26.3.11579264" "cmake;3.22.1" "build-tools;34.0.0" >/dev/null
+          "$SM" --install "ndk;26.3.11579264" "cmake;3.22.1" "build-tools;35.0.0" >/dev/null
       - name: Gradle (assembleRelease; the host compiles for profile ${{ env.GAME }})
         working-directory: dm/android
         run: |
           export GAME="$GAME"
           ./gradlew assembleRelease --no-daemon --stacktrace    # the committed wrapper (Gradle 8.7)
+      - name: 16 KB page-align the APK (uncompressed .so files at 16 KB boundaries)
+        run: |
+          BT="$ANDROID_HOME/build-tools/35.0.0"
+          "$BT/zipalign" -f -P 16 4 dm/android/app/build/outputs/apk/release/app-release-unsigned.apk page-aligned.apk
+          "$BT/zipalign" -c -P 16 4 page-aligned.apk    # the check every release must pass
       - name: Sign (when the keystore secrets are configured), else keep the debug-signed build
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
@@ -116,18 +138,18 @@ jobs:
           KEY_ALIAS_PASSWORD: ${{ secrets.ANDROID_KEY_ALIAS_PASSWORD }}
         run: |
           set -eu
-          APK=dm/android/app/build/outputs/apk/release/app-release-unsigned.apk
+          APK=page-aligned.apk
           OUT=nxnative-${GITHUB_REF_NAME}-android.apk
           if [ -n "${KEYSTORE_BASE64:-}" ]; then
             echo "$KEYSTORE_BASE64" | base64 -d > release.keystore
-            "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks release.keystore \
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks release.keystore \
               --ks-key-alias "$KEY_ALIAS" --ks-pass "pass:$KEYSTORE_PASSWORD" --key-pass "pass:$KEY_ALIAS_PASSWORD" \
               --out "$OUT" "$APK"
             rm release.keystore
           else
             # No keystore configured: the debug key signs it, so the artifact installs (CI-only;
             # replace it with your own key for distribution)
-            "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign --ks ~/.android/debug.keystore \
+            "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks ~/.android/debug.keystore \
               --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android \
               --out "$OUT" "$APK"
           fi

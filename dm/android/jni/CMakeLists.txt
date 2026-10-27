@@ -87,5 +87,14 @@ set_target_properties(dmhost PROPERTIES INTERPROCEDURAL_OPTIMIZATION FALSE)
 # -Bsymbolic: the host's assembly (the gate, the NVN thunks) takes symbol addresses with adrp/add,
 # which cannot go through the PLT a preemptible shared-library symbol would need. Everything the
 # .so defines is resolved inside it - nothing outside overrides the host's own symbols
-target_link_options(dmhost PRIVATE -Wl,-Bsymbolic)
+# -z max-page-size=16384: the ELF's LOAD segments align to 16 KB pages, which 16 KB-page devices
+# (Android 15 in 16 KB mode, Android 16 defaults) require dlopen to accept - a 4 KB-aligned library
+# is rejected outright on them (the instant crash of the first debug build); 4 KB-page devices load
+# a 16 KB-aligned library the same as before (NDK r27+ makes this the default; r26 needs the flag)
+# --no-gc-sections: the NDK toolchain adds --gc-sections to non-Debug links, but the host's reachability
+# is resolved at RUNTIME - the swhle / swforce / swnvn tables sit in sections nothing references by
+# name (only their __start_ / __stop_ boundaries, which lld does not root, and the guest's code calls
+# through them) - so GC discards the tables the linker cannot see the need for; the debug link never
+# passed --gc-sections, which is why only the release build hit the undefined __start_/__stop_ errors
+target_link_options(dmhost PRIVATE -Wl,-Bsymbolic -Wl,-z,max-page-size=16384 -Wl,--no-gc-sections)
 target_link_libraries(dmhost PRIVATE log android aaudio mediandk)

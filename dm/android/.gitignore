@@ -1,0 +1,5 @@
+# The local release key (app/build.gradle.kts reads it when present): never committed - a leaked
+# key signs updates over every install
+keystore.properties
+*.keystore
+*.jks

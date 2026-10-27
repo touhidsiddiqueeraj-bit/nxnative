@@ -38,11 +38,23 @@ class MainActivity : Activity(), ProgressOverlay.Host {
         super.onCreate(savedInstanceState)
         DmFront.attach(this)
         DmFront.activity = this
-        HostJni.load()
 
         root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
         setContentView(root)
+
+        // The host library first: a failure here (a device the build does not fit) shows its reason
+        // instead of crashing the process - the shell without it cannot run a game anyway
+        try {
+            HostJni.load()
+        } catch (e: UnsatisfiedLinkError) {
+            val hint = TextView(this).apply {
+                text = getString(R.string.load_failed, e.message ?: e.javaClass.simpleName)
+                setTextColor(Color.WHITE); gravity = Gravity.CENTER; setPadding(48, 48, 48, 48)
+            }
+            root.addView(hint)
+            return
+        }
 
         val files = filesDir.absolutePath
         extractPacked(files)
