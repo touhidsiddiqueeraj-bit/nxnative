@@ -1,4 +1,19 @@
     .arch_extension lse
+#ifdef __ELF__
+// On ELF (the Android build) a C symbol's assembly name has no underscore: the defines rename the
+// Mach-O-style names below so one body serves both platforms. Address pairs take the ELF spellings
+// at their use sites (adrp + :lo12:; Mach-O's @PAGE / @PAGEOFF are Darwin-only).
+#define _nvn_unimpl_entry nvn_unimpl_entry
+#define _nvn_unimpl_c nvn_unimpl_c
+#define _nvn_prof_entry nvn_prof_entry
+#define _nvn_big_entry nvn_big_entry
+#define _nvn_real nvn_real
+#define _nvn_big_real nvn_big_real
+#define _nvn_prof_ticks nvn_prof_ticks
+#define _nvn_slot nvn_slot
+#define _mach_absolute_time mach_absolute_time
+#define _dm_bigstack_enter dm_bigstack_enter
+#endif
 // Common entry for unimplemented NVN functions: when the thunk comes in, x16 = this function's slot address (nvn_slot[i]).
 // Calls nvn_unimpl_c(slot, x0, x1, x2) to report a failure and log the name, returns 0.
     .text
@@ -33,19 +48,34 @@ _nvn_prof_entry:
     stp q2, q3, [sp, #128]
     stp q4, q5, [sp, #160]
     stp q6, q7, [sp, #192]
+#ifdef __ELF__
+    adrp x9, _nvn_slot
+    add x9, x9, :lo12:_nvn_slot
+#else
     adrp x9, _nvn_slot@PAGE
     add x9, x9, _nvn_slot@PAGEOFF
+#endif
     sub x16, x16, x9
     lsr x16, x16, #4                 // Slot index i
     str x16, [sp, #80]
     bl _mach_absolute_time
     str x0, [sp, #88]
     ldr x16, [sp, #80]
+#ifdef __ELF__
+    adrp x9, _nvn_real
+    add x9, x9, :lo12:_nvn_real
+#else
     adrp x9, _nvn_real@PAGE
     add x9, x9, _nvn_real@PAGEOFF
+#endif
     ldr x17, [x9, x16, lsl #3]
-    adrp x9, _nvn_slot@PAGE          // x16 back to the slot address: when the real implementation is the big-stack entry (nvn_big_entry) it finds the implementation through it
+#ifdef __ELF__
+    adrp x9, _nvn_slot
+    add x9, x9, :lo12:_nvn_slot
+#else
+    adrp x9, _nvn_slot@PAGE
     add x9, x9, _nvn_slot@PAGEOFF
+#endif
     add x16, x9, x16, lsl #4
     ldp x0, x1, [sp, #16]
     ldp x2, x3, [sp, #32]
@@ -64,8 +94,13 @@ _nvn_prof_entry:
     ldr x10, [sp, #88]
     sub x9, x9, x10
     ldr x16, [sp, #80]
+#ifdef __ELF__
+    adrp x10, _nvn_prof_ticks
+    add x10, x10, :lo12:_nvn_prof_ticks
+#else
     adrp x10, _nvn_prof_ticks@PAGE
     add x10, x10, _nvn_prof_ticks@PAGEOFF
+#endif
     add x10, x10, x16, lsl #3
     stadd x9, [x10]
     ldp x0, x1, [sp, #16]
@@ -81,11 +116,21 @@ _nvn_prof_entry:
     .globl _nvn_big_entry
     .p2align 2
 _nvn_big_entry:
+#ifdef __ELF__
+    adrp x17, _nvn_slot
+    add x17, x17, :lo12:_nvn_slot
+#else
     adrp x17, _nvn_slot@PAGE
     add x17, x17, _nvn_slot@PAGEOFF
+#endif
     sub x16, x16, x17
     lsr x16, x16, #4                 // Slot index i
+#ifdef __ELF__
+    adrp x17, _nvn_big_real
+    add x17, x17, :lo12:_nvn_big_real
+#else
     adrp x17, _nvn_big_real@PAGE
     add x17, x17, _nvn_big_real@PAGEOFF
+#endif
     ldr x16, [x17, x16, lsl #3]
     b _dm_bigstack_enter

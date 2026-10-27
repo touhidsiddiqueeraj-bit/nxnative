@@ -3,6 +3,17 @@
 // 1) unimpl_entry: stub entry for unimplemented imports, x9 = stub number; save x0-x8+lr and call unimpl_c(idx, regs).
 // 2) dm_gate: the rewriter replaces svc / cntpct reads with "bl to this entry". On entry lr = the gate block return point (gate_dispatch uses it to look up which gate this is),
 //    save x0-x30 to a contiguous area on the stack, call gate_dispatch(ret, regs), write back x0 (gate return value), return.
+#ifdef __ELF__
+// On ELF (the Android build) a C symbol's assembly name has no underscore: the defines rename the
+// Mach-O-style names below so one body serves both platforms.
+#define _unimpl_stubs unimpl_stubs
+#define _unimpl_entry unimpl_entry
+#define _unimpl_c unimpl_c
+#define _dm_gate dm_gate
+#define _gate_dispatch gate_dispatch
+#define _dm_thread_enter dm_thread_enter
+#define _dm_thread_returned dm_thread_returned
+#endif
     .text
     .globl _unimpl_stubs
     .p2align 3

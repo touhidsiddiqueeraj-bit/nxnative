@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- the Joy-Con pair silhouette: two rounded rails -->
+    <path android:fillColor="#e8ecf4"
+        android:pathData="M34,30 h10 a8,8 0 0 1 8,8 v32 a8,8 0 0 1 -8,8 h-10 a6,6 0 0 1 -6,-6 v-36 a6,6 0 0 1 6,-6 z" />
+    <path android:fillColor="#e8ecf4"
+        android:pathData="M74,30 h-10 a8,8 0 0 0 -8,8 v32 a8,8 0 0 0 8,8 h10 a6,6 0 0 0 6,-6 v-36 a6,6 0 0 0 -6,-6 z" />
+    <path android:fillColor="#0b0d12" android:pathData="M41,42 m-3,0 a3,3 0 1 1 6,0 a3,3 0 1 1 -6,0" />
+    <path android:fillColor="#0b0d12" android:pathData="M67,42 m-3,0 a3,3 0 1 1 6,0 a3,3 0 1 1 -6,0" />
+</vector>

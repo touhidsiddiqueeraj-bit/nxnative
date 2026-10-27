@@ -7,6 +7,8 @@
 # from its Mac outputs. One output directory per game: the chain version is the same for every game   Environment: DM_GAME=game profile (required, dm/games/<id>), XLATE=path to the translation tool (default the in-repo dmsh_xlate_bin), DMSH_CAS=content-addressed cache dir (default <output cache dir>/cas), DMSH_PREFILL=Mac library root[=iOS library root] (separated by :, their b-*/ go into the MSL-keyed compile cache first; sibling b-*/ always do), J=concurrency
 # Build output: <key>_b.metallib, <key>_b.json (replay reflection, including drv_reads, the runtime read offsets into driver segments c0 / c2), <key>_b.metal (MSL)
 # Environment IOSOUT=dir: the same MSL also goes through dm/ios/tools/ios_metal.compile to produce an iphoneos metallib + reflection (chain_metal records the iOS compile convention)
+# Environment SPVOUT=dir: the translated SPIR-V itself is copied there too, as <key>.spv beside <key>_b.json (the Android build's shader format: the Vulkan backend consumes the chain's SPIR-V
+#   directly; the Metal steps still run and cache, so the same run serves both platforms)
 # Final summary: success / failure counts and the distribution of reasons; distribution of driver segment read offsets (those outside the range the replay layer can fill are listed separately)
 import ast, inspect, os, re, sys, json, struct, hashlib, shutil, subprocess, tempfile, collections, threading, concurrent.futures as cf
 import dmsh_geometry, dmsh_atomic
@@ -25,10 +27,13 @@ SPIRV_CROSS = dmsh_chain.SPIRV_CROSS   # the in-repo build the lock records
 FACTS = dmsh_facts.load()
 if not os.path.exists(dmsh_facts.TABLE): sys.exit(f'[RED] no answer table {dmsh_facts.TABLE} (it comes with the game profile; an empty table = every query answered with defaults)')
 IOSOUT = os.environ.get('IOSOUT')   # if set, also build the iOS version (iphoneos metallib + reflection) into that directory
+SPVOUT = os.environ.get('SPVOUT')   # if set, also copy the translated SPIR-V (the Android build's shader format) into that directory
+if SPVOUT:
+    SPVOUT = os.path.join(SPVOUT, 'b-' + CHAIN); os.makedirs(SPVOUT, exist_ok=True)
 if IOSOUT:
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); import ios_metal
     IOSOUT = os.path.join(IOSOUT, 'b-' + CHAIN); os.makedirs(IOSOUT, exist_ok=True)
-for _d in [out] + ([IOSOUT] if IOSOUT else []):   # one chain version serves every game, so b-<V>/ alone does not keep two games' libraries apart
+for _d in [out] + ([IOSOUT] if IOSOUT else []) + ([SPVOUT] if SPVOUT else []):   # one chain version serves every game, so b-<V>/ alone does not keep two games' libraries apart
     _g = dmsh_chain.read_stamp(_d).get('game')
     if _g and _g != GAME.id: sys.exit(f'[RED] {_d} holds the shader libraries of game {_g}, not {GAME.id}: give each game its own output directory')
 MAP = str(GAME.table('shader_map.tsv'))
@@ -121,9 +126,13 @@ def cache_outputs(key, digest, cached=False):
     root = cache_path(digest); files = {}
     for label, directory, names in (
             ('mac', out, [key + '_b.metallib', key + '_b.metal', key + '_b.json']),
-            ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json'])):
+            ('ios', IOSOUT, [key + '_b.metallib', key + '_b.json']),
+            ('spv', SPVOUT, [key + '.spv', key + '_b.json'])):
         if not directory: continue
         base = os.path.join(root, label) if cached else directory
+        if label == 'spv':
+            if not os.path.exists(os.path.join(base, key + '.spv')) or not os.path.exists(os.path.join(base, key + '_b.json')): return None
+            files[label] = [key + '.spv', key + '_b.json']; continue
         names += [key + s + ext for s in ('_bg0', '_bg1', '_bg2', '_bg3', '_bg4', '_bgv') for ext in ('.metallib', '.json', '.metal') if label == 'mac' or ext != '.metal']
         found = [n for n in names if os.path.exists(os.path.join(base, n))]
         if key + '_b.metallib' not in found or key + '_b.json' not in found: return None
@@ -135,7 +144,7 @@ def restore_cache(key, digest):
     if not found: return False
     root, files = found
     for label, names in files.items():
-        directory = out if label == 'mac' else IOSOUT
+        directory = out if label == 'mac' else IOSOUT if label == 'ios' else SPVOUT
         for name in names:
             src = os.path.join(root, label, name); dst = os.path.join(directory, name)
             if name.endswith('.json'):
@@ -161,10 +170,10 @@ def publish_cache(key, digest, rule_fp, code_fp):
     root, files = found
     for label, names in files.items():
         d = os.path.join(root, label); os.makedirs(d, exist_ok=True)
-        for name in names: clone(os.path.join(out if label == 'mac' else IOSOUT, name), os.path.join(d, name))
+        for name in names: clone(os.path.join({'mac': out, 'ios': IOSOUT, 'spv': SPVOUT}[label], name), os.path.join(d, name))
         for name in names:
             if name.endswith('.json'):
-                src = os.path.join(out if label == 'mac' else IOSOUT, name)
+                src = os.path.join(out if label == 'mac' else IOSOUT if label == 'ios' else SPVOUT, name)
                 value = json.load(open(src)); value.pop('fetch', None); value.pop('vin', None); value.pop('pull', None)   # the side libraries are made again from the restored MSL (fetch_finish, vin_finish, pull_finish)
                 atomic_json(os.path.join(d, name), value)
     atomic_json(cache_meta_path(key), {'digest': digest, 'rule_fp': rule_fp, 'code_fp': code_fp})
@@ -184,7 +193,7 @@ def bf_cache_root(digest): return os.path.join(CAS, 'variant', digest)
 
 def bf_cache_restore(key, digest, fmeta, fmsl):
     root = bf_cache_root(digest)
-    names = ['metal', 'mac.metallib'] + (['ios.metallib'] if IOSOUT else [])
+    names = ['metal', 'mac.metallib'] + (['ios.metallib'] if IOSOUT else [])   # the pulling-variant library is Metal-only: its Vulkan counterpart comes with the draw path
     if not all(os.path.exists(os.path.join(root, n)) for n in names): return False
     clone(os.path.join(root, 'metal'), fmsl)
     clone(os.path.join(root, 'mac.metallib'), os.path.join(out, key + '_bf.metallib'))
@@ -941,6 +950,8 @@ def finish(key, w, j, c1):
         try: MTL.compile('mac', msl, lib)
         except subprocess.CalledProcessError as e: return 'metal failed', str(e)[:160], None
     clone(msl, os.path.join(out, key + '_b.metal'))
+    if SPVOUT:   # Android: the translated SPIR-V itself, as the Vulkan backend loads it (after the single-lane / integer-input rewrites above)
+        clone(os.path.join(w, key + '.spv'), os.path.join(SPVOUT, key + '.spv'))
     if IOSOUT:   # iOS: the same MSL goes through iOS's single compile convention (dm/ios/tools/ios_metal.py) to produce an iphoneos metallib
         try: MTL.compile('ios', msl, os.path.join(IOSOUT, key + '_b.metallib'))
         except subprocess.CalledProcessError as e: return 'iOS metal failed', str(e)[:160], None

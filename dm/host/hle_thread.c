@@ -16,6 +16,9 @@
 #include <sys/mman.h>
 #include <time.h>
 #include <mach/mach.h>
+#if defined(__ANDROID__)
+#include <dirent.h>   // the host-thread part of the state dump walks /proc/self/task
+#endif
 #include <pthread/qos.h>
 #include <dlfcn.h>
 #include <stdatomic.h>
@@ -328,7 +331,9 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t || !atomic_load(&t->pause_req) || atomic_load(&t->svc_regs)) return;
-    ucontext_t *uc = uc_; const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
+    ucontext_t *uc = uc_;
+#if defined(__APPLE__)
+    const struct __darwin_arm_thread_state64 *ss = &uc->uc_mcontext->__ss;
     if (!module_of((void *)__darwin_arm_thread_state64_get_pc(*ss))) return;   // in host code: do not stop; the requester resends
     pthread_mutex_lock(&G);
     if (t->pause_req) {
@@ -340,6 +345,19 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
         t->ctx_fp = __darwin_arm_thread_state64_get_fp(*ss); t->ctx_lr = __darwin_arm_thread_state64_get_lr(*ss);
         t->ctx_sp = __darwin_arm_thread_state64_get_sp(*ss) - 32; t->ctx_pc = __darwin_arm_thread_state64_get_pc(*ss); t->ctx_pstate = ss->__cpsr;
         memcpy(t->ctx_v, uc->uc_mcontext->__ns.__v, sizeof t->ctx_v); t->ctx_fpcr = uc->uc_mcontext->__ns.__fpcr; t->ctx_fpsr = uc->uc_mcontext->__ns.__fpsr;
+#else
+    // Linux: mcontext_t is struct sigcontext itself (regs / pc / sp / pstate, the fpregs block below)
+    if (!module_of((void *)uc->uc_mcontext.pc)) return;   // in host code: do not stop; the requester resends
+    pthread_mutex_lock(&G);
+    if (t->pause_req) {
+        for (int i = 0; i < 29; i++) t->ctx_x[i] = uc->uc_mcontext.regs[i];
+        // x18 on Linux is a normal callee-saved register the rewriter also re-slots (patch_nso.py K18); the thread slot's value is what a collector needs to see
+        t->ctx_x[18] = (uint64_t)(uintptr_t)pthread_getspecific(g_key18);
+        t->ctx_fp = uc->uc_mcontext.regs[29]; t->ctx_lr = uc->uc_mcontext.regs[30];
+        t->ctx_sp = uc->uc_mcontext.sp - 32; t->ctx_pc = uc->uc_mcontext.pc; t->ctx_pstate = uc->uc_mcontext.pstate;
+        { struct user_fpsimd_struct { __uint128_t v[32]; uint32_t fpcr, fpsr; } *f = (void *)&uc->uc_mcontext.__reserved;
+          memcpy(t->ctx_v, f->v, sizeof t->ctx_v); t->ctx_fpcr = f->fpcr; t->ctx_fpsr = f->fpsr; }   // the fp register block follows the gpr one in the reserved area
+#endif
         t->ctx_ok = 1; t->paused = 1; pthread_cond_broadcast(&t->pcv);
         while (t->pause_req) pthread_cond_wait(&t->pcv, &G);
         t->paused = 0; t->ctx_ok = 0;
@@ -402,6 +420,7 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
     h->lr = t->last_lr; h->sleeping = t->sleeping; h->host_work = t->host_work && *t->host_work; h->rs = -1;
     char nb[48]; snprintf(h->name, sizeof h->name, "%s", thr_name(t, nb, sizeof nb));
     if (!t->mport) return;
+#if defined(__APPLE__)
     thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
     if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS) h->rs = bi.run_state;
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
@@ -417,6 +436,32 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
         }
     }
     thread_resume(t->mport);
+#else
+    // Linux has no per-thread suspend for an ordinary process. Pause it the way the garbage
+    // collector's stop-the-world does (on_pause_sig): request, signal, read the saved context,
+    // resume. The frame chain then walks the same way, through vm_read_overwrite's safe reads.
+    if (pthread_kill(t->pt, SIGUSR2)) return;
+    pthread_mutex_lock(&G);
+    atomic_store(&t->pause_req, 1);
+    struct timespec ts = {0, 20000000};
+    for (int wait = 0; wait < 50 && !t->ctx_ok; wait++) {   // at most 1 s: a thread that stays in host code never stops (the loop below leaves have = 0); ctx_ok is written under G
+        pthread_mutex_unlock(&G); nanosleep(&ts, 0); pthread_kill(t->pt, SIGUSR2); pthread_mutex_lock(&G);
+    }
+    if (t->ctx_ok) {
+        h->have = 1; h->guest = module_of((void *)t->ctx_pc) != NULL;
+        h->x[0] = t->ctx_x[0]; h->x[1] = t->ctx_x[1]; h->x[2] = t->ctx_x[2]; for (int i = 19; i <= 25; i++) h->x[3 + i - 19] = t->ctx_x[i];
+        h->pc[h->npc++] = t->ctx_pc; h->pc[h->npc++] = t->ctx_lr;
+        uint64_t fp = t->ctx_fp;
+        while (h->npc < 24) {
+            uint64_t fr[2]; vm_size_t got = 0; if (!fp || vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &got) || got != 16) break;
+            h->pc[h->npc++] = fr[1]; fp = fr[0];
+        }
+    }
+    atomic_store(&t->pause_req, 0); pthread_cond_broadcast(&t->pcv);
+    pthread_mutex_unlock(&G);
+    // wait until it actually resumed (the pause handler clears it on its way out)
+    for (int wait = 0; wait < 50 && t->paused; wait++) { struct timespec t2 = {0, 20000000}; nanosleep(&t2, 0); }
+#endif
 }
 static void hitch_log(const hitch_t *h) {
     static const char *kinds[] = {"run", "mutex", "condvar", "address", "sync"};
@@ -577,11 +622,12 @@ int thr_find_by_name(const char *name, pthread_t *out) {
 // State dump (called from crash.c on watchdog / crash; read-only, takes no lock): what each guest thread is waiting on and where its most recent SVC was issued from
 // During a state dump, take the backtrace of other guest threads: suspend → read registers → walk the frame pointer chain (both guest code and gate blocks keep the x29 chain) → resume; only main / sdk frames are printed
 static void thr_bt(thr_t *t) {
+#if defined(__APPLE__)
     if (!t->mport || t->exited || t->mport == mach_thread_self()) return;
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
     arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
     if (thread_get_state(t->mport, ARM_THREAD_STATE64, (thread_state_t)&st, &n) == KERN_SUCCESS) {
-        // Threads not waiting in a system call (running guest code, possibly spinning on a condition): print the callee-saved registers x19–x28, plus 128 bytes of the memory pointed to by each of x19 / x20.
+        // Threads not waiting in a system call (running guest code, possibly spinning on a condition): print the callee-saved registers x19-x28, plus 128 bytes of the memory pointed to by each of x19 / x20.
         // A thread spinning on a condition is told apart by its callee-saved registers (often the object it waits on) and the memory they point to
         if (t->wkind == 0) { char rl[400]; int q = snprintf(rl, sizeof rl, "[dm]   %#x registers pc=", t->handle); uint64_t pc = __darwin_arm_thread_state64_get_pc(st); module_t *pm = module_of((void *)pc);
             q += pm ? snprintf(rl + q, sizeof rl - q, "%s+%#llx", pm->name, pc - (uint64_t)pm->base) : snprintf(rl + q, sizeof rl - q, "%#llx", pc);
@@ -591,7 +637,7 @@ static void thr_bt(thr_t *t) {
                 if (a < 0x100000000ull || vm_read_overwrite(mach_task_self(), a, sizeof raw, (vm_address_t)raw, &g) || g != sizeof raw) continue;
                 char hx[420]; int h = 0; for (int k = 0; k < 128; k += 4) h += snprintf(hx + h, sizeof hx - h, "%08x ", *(uint32_t *)(raw + k));
                 uint64_t vt = *(uint64_t *)raw; module_t *vm_ = module_of((void *)vt); char vs[64] = ""; if (vm_) snprintf(vs, sizeof vs, " (first 8 bytes = %s+%#llx)", vm_->name, vt - (uint64_t)vm_->base);
-                fprintf(stderr, "[dm]   %#x x%d → 128 bytes from %#llx%s: %s\n", t->handle, i, a, vs, hx); } }
+                fprintf(stderr, "[dm]   %#x x%d -> 128 bytes from %#llx%s: %s\n", t->handle, i, a, vs, hx); } }
         uint64_t fp = __darwin_arm_thread_state64_get_fp(st), lr = __darwin_arm_thread_state64_get_lr(st);
         // Threads running guest code: print the 1 KiB above the stack top as is (the registers saved by the outer frames are in there, so the wait object and resource address can be recovered afterwards)
         if (t->wkind == 0 && module_of((void *)__darwin_arm_thread_state64_get_pc(st))) { uint64_t sp = __darwin_arm_thread_state64_get_sp(st), stk[128]; vm_size_t g = 0;   // Printed only if pc is inside a guest module: a thread in sleep / yield has its pc in a system library, and the stack is not worth looking at
@@ -609,6 +655,45 @@ static void thr_bt(thr_t *t) {
         fprintf(stderr, "%s\n", line);
     }
     thread_resume(t->mport);
+#else
+    // Linux: the same dump through the pause machinery (on_pause_sig saves the context; it is read
+    // here and the thread resumes when the request drops). A thread that stays in host code never
+    // stops, and the dump simply leaves it out, as the hitch dump does.
+    if (!t->pt || t->exited || t->pt == pthread_self()) return;
+    if (pthread_kill(t->pt, SIGUSR2)) return;
+    pthread_mutex_lock(&G);
+    atomic_store(&t->pause_req, 1);
+    struct timespec ts = {0, 20000000};
+    for (int wait = 0; wait < 50 && !t->ctx_ok; wait++) { pthread_mutex_unlock(&G); nanosleep(&ts, 0); pthread_kill(t->pt, SIGUSR2); pthread_mutex_lock(&G); }
+    if (t->ctx_ok) {
+        if (t->wkind == 0) { char rl[400]; int q = snprintf(rl, sizeof rl, "[dm]   %#x registers pc=", t->handle); module_t *pm = module_of((void *)t->ctx_pc);
+            q += pm ? snprintf(rl + q, sizeof rl - q, "%s+%#llx", pm->name, t->ctx_pc - (uint64_t)pm->base) : snprintf(rl + q, sizeof rl - q, "%#llx", t->ctx_pc);
+            for (int i = 19; i <= 28; i++) q += snprintf(rl + q, sizeof rl - q, " x%d=%#llx", i, t->ctx_x[i]);
+            fprintf(stderr, "%s\n", rl);
+            for (int i = 19; i <= 20; i++) { uint8_t raw[128]; vm_size_t g = 0; uint64_t a = t->ctx_x[i];
+                if (a < 0x100000000ull || vm_read_overwrite(mach_task_self(), a, sizeof raw, (vm_address_t)raw, &g) || g != sizeof raw) continue;
+                char hx[420]; int h = 0; for (int k = 0; k < 128; k += 4) h += snprintf(hx + h, sizeof hx - h, "%08x ", *(uint32_t *)(raw + k));
+                uint64_t vt = *(uint64_t *)raw; module_t *vm_ = module_of((void *)vt); char vs[64] = ""; if (vm_) snprintf(vs, sizeof vs, " (first 8 bytes = %s+%#llx)", vm_->name, vt - (uint64_t)vm_->base);
+                fprintf(stderr, "[dm]   %#x x%d -> 128 bytes from %#llx%s: %s\n", t->handle, i, a, vs, hx); } }
+        uint64_t fp = t->ctx_fp, lr = t->ctx_lr;
+        if (t->wkind == 0 && module_of((void *)t->ctx_pc)) { uint64_t stk[128]; vm_size_t g = 0;
+            if (t->ctx_sp > 0x100000000ull && !vm_read_overwrite(mach_task_self(), t->ctx_sp, sizeof stk, (vm_address_t)stk, &g) && g == sizeof stk)
+                for (int r = 0; r < 128; r += 8) fprintf(stderr, "[dm]   %#x stack sp+%#05x: %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", t->handle, r * 8,
+                        stk[r], stk[r + 1], stk[r + 2], stk[r + 3], stk[r + 4], stk[r + 5], stk[r + 6], stk[r + 7]); }
+        char line[1024]; int p = snprintf(line, sizeof line, "[dm]   %#x backtrace:", t->handle), nf = 0;
+        for (int k = 0; k < 64 && fp && nf < 20 && p < (int)sizeof line - 40; k++) {
+            module_t *m = module_of((void *)lr);
+            if (m) { p += snprintf(line + p, sizeof line - p, " %s+%#llx", m->name, lr - (uint64_t)m->base); nf++; }
+            uint64_t fr[2]; vm_size_t g2 = 0;
+            if (vm_read_overwrite(mach_task_self(), fp, 16, (vm_address_t)fr, &g2) || g2 != 16 || fr[0] <= fp) break;
+            fp = fr[0]; lr = fr[1];
+        }
+        fprintf(stderr, "%s\n", line);
+    }
+    atomic_store(&t->pause_req, 0); pthread_cond_broadcast(&t->pcv);
+    pthread_mutex_unlock(&G);
+    for (int wait = 0; wait < 50 && t->paused; wait++) { struct timespec t2 = {0, 20000000}; nanosleep(&t2, 0); }
+#endif
 }
 void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
@@ -639,6 +724,7 @@ void svc_thread_dump(void) {
                         fprintf(stderr, "[dm]   %#x waited-for object, 64 bytes from %#llx: %s\n", t->handle, t->waddr & ~0xfull, hx); }
         thr_bt(t);
     }
+#if defined(__APPLE__)
     // Threads created by the host itself (graphics present, audio, movie decoding, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
     thread_act_array_t ths; mach_msg_type_number_t nth = 0;
     if (task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
@@ -666,6 +752,23 @@ void svc_thread_dump(void) {
         }
         vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
     }
+#else
+    // Linux: the host threads are enumerated from /proc/self/task; stopping one for a backtrace is
+    // not possible for an ordinary process, so the dump lists the threads and their names - the
+    // guest table above carries the backtraces that matter (thr_bt).
+    { DIR *d = opendir("/proc/self/task");
+      if (d) { struct dirent *e;
+          while ((e = readdir(d))) {
+              if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+              int tid = atoi(e->d_name);
+              int guest = 0; for (thr_t *t = g_all; t; t = t->all) if (t->pt && dm_shim_thread_id(t->pt) == tid) { guest = 1; break; }
+              if (guest || tid == (int)dm_shim_thread_id(pthread_self())) continue;
+              char comm[64] = "?"; char cp[96]; snprintf(cp, sizeof cp, "/proc/self/task/%d/comm", tid);
+              FILE *cf = fopen(cp, "re"); if (cf) { size_t r = fread(comm, 1, sizeof comm - 1, cf); comm[r ? r - (comm[r - 1] == '\n') : 0] = 0; fclose(cf); }
+              fprintf(stderr, "[dm] host thread %d (%s): a host thread cannot be stopped for a backtrace on Linux, listed only\n", tid, comm);
+          }
+          closedir(d); } }
+#endif
 }
 
 // Same-core wake handoffs apply to every game. core_preempt additionally checks

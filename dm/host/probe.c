@@ -7,7 +7,7 @@
 #include <sys/mman.h>
 #include <libkern/OSCacheControl.h>
 #include <mach/mach.h>
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)   // runtime codegen diagnostics: Apple platforms only (iOS forbids them, Android W^X does too)
 #include <mach/mach_vm.h>   // the write watch (DM_PROBE_WATCH): iOS's SDK has no mach_vm.h
 #endif
 #include <pthread.h>
@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 void crash_set_trap_hook(int (*fn)(ucontext_t *uc));
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)   // runtime codegen diagnostics: Apple platforms only (iOS forbids them, Android W^X does too)
 // Syntax module:offset[@x0 offset]. Put a brk at the guest address; on hit print x0..x3 (and the readable strings they point to) and a backtrace, then execute the original instruction from a trampoline slot and jump back.
 // The trampoline borrows x16: place probes only at function entries or at points where x16 is dead; the original instruction must not be PC-relative (adr/adrp/b/bl/ldr literal/cbz...).
 #define MAX_PROBE 16
@@ -107,36 +107,50 @@ static void probe_dump_once(void) {
     fwrite(m->base + strtoull(o, 0, 16), 1, strtoull(n, 0, 16), fp); fclose(fp);
     LOG("probe dump %s+%s length %s → %s", mod, o, n, f ? f : def);
 }
+// Register access through the ucontext (crash.c spells the same macros): Darwin wraps the arm64
+// state in __ss; Linux's mcontext_t is struct sigcontext itself.
+#if defined(__APPLE__)
+#define UC_PC(u)   ((u)->uc_mcontext->__ss.__pc)
+#define UC_LR(u)   ((u)->uc_mcontext->__ss.__lr)
+#define UC_FP(u)   ((u)->uc_mcontext->__ss.__fp)
+#define UC_X(u, i) ((u)->uc_mcontext->__ss.__x[i])
+#else
+#define UC_PC(u)   ((u)->uc_mcontext.pc)
+#define UC_LR(u)   ((u)->uc_mcontext.regs[30])   // x30 = lr on Linux arm64
+#define UC_FP(u)   ((u)->uc_mcontext.regs[29])
+#define UC_X(u, i) ((u)->uc_mcontext.regs[i])
+#endif
+
 static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the SIGTRAP branch of crash.c
-    uint64_t pc = uc->uc_mcontext->__ss.__pc;
+    uint64_t pc = UC_PC(uc);
     for (int i = 0; i < g_nprobe; i++) if (g_probe[i].at == pc) {
-        if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
+        if (g_probe[i].fn) { g_probe[i].hits++; g_probe[i].fn(uc); UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1; }
         uint64_t frame = dm_guest_frame();
         if (frame < g_probe_frame_first || frame > g_probe_frame_last || (g_probe_limit && g_probe[i].hits >= g_probe_limit)) {
-            uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1;
+            UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1;
         }
         if (g_probe[i].freg >= 0) {   // ?xN=value / ?[xN+offset]=value: pass through silently when it does not match
-            uint64_t v = uc->uc_mcontext->__ss.__x[g_probe[i].freg]; vm_size_t g = 0;
+            uint64_t v = UC_X(uc, g_probe[i].freg); vm_size_t g = 0;
             if (g_probe[i].foff >= 0 && vm_read_overwrite(mach_task_self(), v + g_probe[i].foff, 8, (vm_address_t)&v, &g)) v = ~g_probe[i].fval;
-            if (v != g_probe[i].fval) { uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
+            if (v != g_probe[i].fval) { UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1; }
         }
         if (g_probe[i].hreg >= 0 && g_hw.want) {   // !xN with DM_PROBE_HEAPNAME: report only hits on heaps of that name
-            char nm[128]; probe_heapname(uc->uc_mcontext->__ss.__x[g_probe[i].hreg], nm, sizeof nm);
-            if (!strstr(nm, g_hw.want)) { uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot; return 1; }
+            char nm[128]; probe_heapname(UC_X(uc, g_probe[i].hreg), nm, sizeof nm);
+            if (!strstr(nm, g_hw.want)) { UC_PC(uc) = (uint64_t)g_probe[i].slot; return 1; }
         }
         probe_dump_once();
         flockfile(stderr);   // One block per hit when threads hit at once
         { extern uint64_t g_t0_ns; uint64_t now_ns(void); uint32_t thr_cur_handle(void); fprintf(stderr, "[dm] PROBE %s #%u [%.4fs] F=%llu T=%x", g_probe[i].name, ++g_probe[i].hits, (now_ns() - g_t0_ns) / 1e9, (unsigned long long)frame, thr_cur_handle()); }
-        for (int r = 0; r < 8; r++) { uint64_t v = uc->uc_mcontext->__ss.__x[r]; fprintf(stderr, " x%d=%#llx", r, v); probe_str(v); }
-        for (int r = 19; r < 24; r++) fprintf(stderr, " x%d=%#llx", r, uc->uc_mcontext->__ss.__x[r]);
-        if (getenv("DM_PROBE_ALL")) for (int r = 9; r < 19; r++) fprintf(stderr, " x%d=%#llx", r, uc->uc_mcontext->__ss.__x[r]);   // also print x9–x18
-        fprintf(stderr, " lr=%#llx", uc->uc_mcontext->__ss.__lr);
-        { uint64_t x8 = uc->uc_mcontext->__ss.__x[8]; Dl_info di; fprintf(stderr, " x8=%#llx", x8);   // x8: indirect call targets are often here (probe placed before blr x8)
+        for (int r = 0; r < 8; r++) { uint64_t v = UC_X(uc, r); fprintf(stderr, " x%d=%#llx", r, v); probe_str(v); }
+        for (int r = 19; r < 24; r++) fprintf(stderr, " x%d=%#llx", r, UC_X(uc, r));
+        if (getenv("DM_PROBE_ALL")) for (int r = 9; r < 19; r++) fprintf(stderr, " x%d=%#llx", r, UC_X(uc, r));   // also print x9–x18
+        fprintf(stderr, " lr=%#llx", UC_LR(uc));
+        { uint64_t x8 = UC_X(uc, 8); Dl_info di; fprintf(stderr, " x8=%#llx", x8);   // x8: indirect call targets are often here (probe placed before blr x8)
           if (dladdr((void *)x8, &di) && di.dli_sname) fprintf(stderr, " (%s+%#lx)", di.dli_sname, (unsigned long)(x8 - (uint64_t)di.dli_saddr)); }
         if (g_probe[i].dump >= 0) {
             uint8_t b[16]; vm_size_t got = 0;
             int dr = (g_probe[i].dump >> 25) & 31;                                    // @xN+offset: based on xN
-            uint64_t at = uc->uc_mcontext->__ss.__x[dr] + (g_probe[i].dump & 0xffffff);
+            uint64_t at = UC_X(uc, dr) + (g_probe[i].dump & 0xffffff);
             if (g_probe[i].dump & 0x1000000) { uint64_t p = 0; vm_size_t g = 0; if (!vm_read_overwrite(mach_task_self(), at, 8, (vm_address_t)&p, &g) && p) at = p + g_probe[i].dpost; else at = 0; }   // @*offset[+post]: dereference first, then dump (post bytes further on)
             if (at && !vm_read_overwrite(mach_task_self(), at, 16, (vm_address_t)b, &got) && got == 16) {
                 fprintf(stderr, " [%sx%d+%#lx]", (g_probe[i].dump & 0x1000000) ? "*" : "", dr, g_probe[i].dump & 0xffffff);
@@ -145,12 +159,12 @@ static int probe_hit(ucontext_t *uc) {   // Registered by probe_install with the
         }
         fputc('\n', stderr);
         { static long xd = -2; if (xd == -2) { const char *e = getenv("DM_PROBE_X2"); xd = e ? strtol(e, 0, 16) : -1; }   // DM_PROBE_X2=bytes: also print the memory x2 points to (to read object fields)
-          if (xd > 0) { uint64_t at = uc->uc_mcontext->__ss.__x[2]; uint8_t b[512]; vm_size_t got = 0; long n = xd > 512 ? 512 : xd;
+          if (xd > 0) { uint64_t at = UC_X(uc, 2); uint8_t b[512]; vm_size_t got = 0; long n = xd > 512 ? 512 : xd;
             if (!vm_read_overwrite(mach_task_self(), at, n, (vm_address_t)b, &got)) { fprintf(stderr, "[dm]   [x2]:"); for (long k = 0; k < (long)got; k += 8) { uint64_t v; memcpy(&v, b + k, 8); fprintf(stderr, "%s%llx", k % 32 ? " " : "\n[dm]   ", (unsigned long long)v); } fputc('\n', stderr); } } }
-        if (g_probe[i].hreg >= 0) probe_heapwalk(uc->uc_mcontext->__ss.__x[g_probe[i].hreg]);
-        dm_backtrace(uc->uc_mcontext->__ss.__fp);
+        if (g_probe[i].hreg >= 0) probe_heapwalk(UC_X(uc, g_probe[i].hreg));
+        dm_backtrace(UC_FP(uc));
         funlockfile(stderr);
-        uc->uc_mcontext->__ss.__pc = (uint64_t)g_probe[i].slot;
+        UC_PC(uc) = (uint64_t)g_probe[i].slot;
         return 1;
     }
     return 0;
@@ -244,14 +258,14 @@ static int watch_fault(void *addr, int is_write, void *ucv) {
             uint64_t b = ea + i;
             if (b >= g_wpg && b < g_wpg + g_wpsz) g_walias[b - g_wpg] = data[i]; else *(volatile uint8_t *)b = data[i];
         }
-        if (wb >= 0) { if (wb == 31) uc->uc_mcontext->__ss.__sp = wbv; else if (wb == 29) uc->uc_mcontext->__ss.__fp = wbv; else if (wb == 30) uc->uc_mcontext->__ss.__lr = wbv; else uc->uc_mcontext->__ss.__x[wb] = wbv; }
+        if (wb >= 0) { if (wb == 31) uc->uc_mcontext->__ss.__sp = wbv; else if (wb == 29) UC_FP(uc) = wbv; else if (wb == 30) UC_LR(uc) = wbv; else uc->uc_mcontext->__ss.__x[wb] = wbv; }
         uc->uc_mcontext->__ss.__pc = pc + 4;
         if (hit) {
             flockfile(stderr);
             { extern uint64_t g_t0_ns; uint64_t now_ns(void); uint32_t thr_cur_handle(void);
               fprintf(stderr, "[dm] WATCH %#llx [%.4fs] T=%x store of %u bytes at %#llx: %#llx → %#llx", (unsigned long long)g_wat, (now_ns() - g_t0_ns) / 1e9, thr_cur_handle(), len, (unsigned long long)ea, (unsigned long long)old, (unsigned long long)watch_val()); }
-            watch_where("pc", pc); watch_where("lr", uc->uc_mcontext->__ss.__lr); fputc('\n', stderr);
-            dm_backtrace(uc->uc_mcontext->__ss.__fp);
+            watch_where("pc", pc); watch_where("lr", UC_LR(uc)); fputc('\n', stderr);
+            dm_backtrace(UC_FP(uc));
             funlockfile(stderr);
         }
         return 1;
@@ -362,7 +376,7 @@ static void watch_install(void) {
 #endif
 
 void probe_install(void) {
-#if !TARGET_OS_IPHONE
+#if !TARGET_OS_IPHONE && !defined(__ANDROID__)   // runtime codegen diagnostics: Apple platforms only (iOS forbids them, Android W^X does too)
     crash_set_trap_hook(probe_hit);
     const char *frames = getenv("DM_PROBE_FRAMES");
     if (frames) {

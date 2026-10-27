@@ -1,0 +1,14 @@
+<resources>
+    <string name="app_name">nxnative</string>
+    <string name="play">Play</string>
+    <string name="reset_defaults">Reset to tested defaults</string>
+    <string name="reset_footer">Brings back all settings this game was tested with.</string>
+    <string name="memory_available">Memory available</string>
+    <string name="no_game_files">Game files not found.\nPack an APK with scripts/build_apk_from_nsp.py and install it again.</string>
+    <string name="save_failed_title">Save failed</string>
+    <string name="save_failed_enospc">Storage is full, so progress was not saved. Free up space and save again.</string>
+    <string name="save_failed_fmt">Saving failed (errno %1$d); progress was not saved.</string>
+    <string name="preparing_shaders">Preparing shaders</string>
+    <string name="ok">OK</string>
+    <string name="cancel">Cancel</string>
+</resources>

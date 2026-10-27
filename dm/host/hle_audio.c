@@ -257,7 +257,12 @@ static void backend_stop(aout *a) {
     if (a->backend == BK_AU) { AudioOutputUnitStop(a->au); a->backend = BK_NONE; }
     else if (a->backend == BK_NULL) null_stop(a);
 }
-static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
+#if TARGET_OS_IPHONE || defined(__ANDROID__)
+#define DM_REAL_AUDIO_DEFAULT 1   // a phone product has sound by default; tests set DM_AUDIO=0 explicitly
+#else
+#define DM_REAL_AUDIO_DEFAULT 0   // the Mac defaults to the silent sink (replays stay silent); DM_AUDIO=1 for real output
+#endif
+static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : DM_REAL_AUDIO_DEFAULT; }
 // Start the AudioUnit of an output whose backend is BK_NONE (callers hold g_aos_lock). When the device refuses (the session is held by a call, or is being reset), the silent sink stands in and the watchdog retries
 static void au_go(aout *a, uint64_t now) {
     OSStatus st = a->au ? AudioOutputUnitStart(a->au) : -1;

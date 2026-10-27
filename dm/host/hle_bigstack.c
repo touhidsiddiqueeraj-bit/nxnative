@@ -37,6 +37,53 @@ uintptr_t dm_bigstack_top(uintptr_t sp) {
 }
 
 // x16 = implementation. Frame (on the original stack, 0xa0 bytes): +0x00 x0-x8, x16, +0x50 d0-d7, +0x90 x29 / x30. After the switch the original sp is stored at the new stack top and restored when the implementation returns
+#if defined(__ELF__)
+// On ELF a C symbol's assembly name has no underscore; .hidden is .private_extern's counterpart.
+__asm__(
+    ".text\n"
+    ".p2align 2\n"
+    ".globl dm_bigstack_enter\n"
+    ".hidden dm_bigstack_enter\n"
+    "dm_bigstack_enter:\n"
+    "    sub sp, sp, #0xa0\n"
+    "    stp x29, x30, [sp, #0x90]\n"
+    "    add x29, sp, #0x90\n"
+    "    stp x0, x1, [sp, #0x00]\n"
+    "    stp x2, x3, [sp, #0x10]\n"
+    "    stp x4, x5, [sp, #0x20]\n"
+    "    stp x6, x7, [sp, #0x30]\n"
+    "    stp x8, x16, [sp, #0x40]\n"
+    "    stp d0, d1, [sp, #0x50]\n"
+    "    stp d2, d3, [sp, #0x60]\n"
+    "    stp d4, d5, [sp, #0x70]\n"
+    "    stp d6, d7, [sp, #0x80]\n"
+    "    mov x0, sp\n"
+    "    bl dm_bigstack_top\n"
+    "    mov x17, x0\n"
+    "    ldp x0, x1, [sp, #0x00]\n"
+    "    ldp x2, x3, [sp, #0x10]\n"
+    "    ldp x4, x5, [sp, #0x20]\n"
+    "    ldp x6, x7, [sp, #0x30]\n"
+    "    ldp x8, x16, [sp, #0x40]\n"
+    "    ldp d0, d1, [sp, #0x50]\n"
+    "    ldp d2, d3, [sp, #0x60]\n"
+    "    ldp d4, d5, [sp, #0x70]\n"
+    "    ldp d6, d7, [sp, #0x80]\n"
+    "    cbz x17, 1f\n"
+    "    mov x9, sp\n"
+    "    mov sp, x17\n"
+    "    stp x9, xzr, [sp, #-16]!\n"
+    "    blr x16\n"
+    "    ldr x9, [sp]\n"
+    "    mov sp, x9\n"
+    "    ldp x29, x30, [sp, #0x90]\n"
+    "    add sp, sp, #0xa0\n"
+    "    ret\n"
+    "1:\n"
+    "    ldp x29, x30, [sp, #0x90]\n"
+    "    add sp, sp, #0xa0\n"
+    "    br x16\n");
+#else
 __asm__(
     ".text\n"
     ".p2align 2\n"
@@ -81,3 +128,4 @@ __asm__(
     "    ldp x29, x30, [sp, #0x90]\n"
     "    add sp, sp, #0xa0\n"
     "    br x16\n");
+#endif
