@@ -8,6 +8,11 @@ game, extract, rewrite the modules, translate the shaders, pack the app - then a
 the same game installs over the last) and installs it with adb. Nothing is launched: the game's icon
 lands on the home screen, the player taps it.
 
+The phone's receiver screen rides along: plugging the phone in raises it (adb shell am start), and
+the build's stages stream to it live (adb forward onto the app's localabstract:nxnative) - so the
+player watches the game arrive on the phone they will play it on. It is the screen's content, never
+a step the build waits on: pull the cable mid-build and everything on the computer still finishes.
+
 Usage (Python 3.10+, no pip packages needed for the window itself):
     python3 dm/android/tools/pc_companion.py          the window
     python3 dm/android/tools/pc_companion.py --check  the same toolchain and device report on stdout
@@ -20,7 +25,9 @@ import os
 import queue
 import re
 import secrets
+import select
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -33,6 +40,15 @@ NDK_VERSION, CMAKE_VERSION, PLATFORM, BT_MIN = '26.3.11579264', '3.22.1', 'andro
 LANGUAGES = ['en-US', 'ja', 'fr', 'de', 'es', 'zh-Hans', 'zh-Hant', 'ko', 'it', 'pt-BR', 'ru']   # -l takes any code; these are the common ones
 SDK_STEPS = ('https://developer.android.com/studio#command-line-tools-only: download the "Command line tools only" zip, '
              'unzip it to ~/android-sdk/cmdline-tools/latest (licenses are accepted on first install), then reopen this check')
+
+# The phone's receiver screen (dm/android ReceiverActivity / ReceiverLink): the socket adb forward
+# pairs with, the activity am start raises (the namespace, not the per-game applicationId), and the
+# template build's own id - the shell app, the one the screen belongs to
+PHONE_SOCKET = 'localabstract:nxnative'
+PHONE_ACTIVITY = 'org.nxnative.android.ReceiverActivity'
+SHELL_ID = 'org.nxnative.shell'
+PROFILE = '010015100B514000'   # a committed profile the host compiles against for the template (the CI workflow's own GAME)
+PING_SECS, LINK_TIMEOUT = 2.0, 8.0   # the link's heartbeat; either end gives up after about four missed
 
 
 # ---- The companion's own settings (~/.nxcompanion/config.json: the SDK path, the signing key's passwords, the last form state) ----
@@ -74,14 +90,14 @@ def sdk_status(sdk):
     if not (sdk / 'ndk' / NDK_VERSION).is_dir(): miss.append(f'ndk;{NDK_VERSION}')
     if not (sdk / 'cmake' / CMAKE_VERSION).is_dir(): miss.append(f'cmake;{CMAKE_VERSION}')
     if not (sdk / 'platforms' / PLATFORM).is_dir(): miss.append(f'platforms;{PLATFORM}')
-    if not bt_dir(sdk): miss.append(f'build-tools;35.0.0 (zipalign -P 16)')
+    if not bt_dir(sdk): miss.append('build-tools;35.0.0 (zipalign -P 16)')
     return {'name': 'Android SDK', 'ok': not miss, 'detail': str(sdk) + ('' if not miss else ' - missing ' + ', '.join(miss)),
             'fix': None if not miss else 'the Install button runs sdkmanager, or by hand: sdkmanager ' + ' '.join(f'"{p}"' for p in sdk_packages()),
             'fix_cmd': [str(sdkmanager_path(sdk))] + sdk_packages() if sdkmanager_path(sdk) else None}
 
 
 def sdk_packages():
-    return [f'platform-tools', f'ndk;{NDK_VERSION}', f'cmake;{CMAKE_VERSION}', f'platforms;{PLATFORM}', 'build-tools;35.0.0']
+    return ['platform-tools', f'ndk;{NDK_VERSION}', f'cmake;{CMAKE_VERSION}', f'platforms;{PLATFORM}', 'build-tools;35.0.0']
 
 
 def sdkmanager_path(sdk):
@@ -204,6 +220,167 @@ def adb_install_command(adb, serial, apk):
     return [adb] + (['-s', serial] if serial else []) + ['install', '-r', str(apk)]
 
 
+# ---- The phone's receiver screen ----
+
+def am_start_command(adb, serial, pkg):
+    """Raise the receiver on the phone: the manifest's activity under the app's own applicationId
+    (a game's id differs from the namespace, so the component is spelled out in full)."""
+    return [adb, '-s', serial, 'shell', 'am', 'start', '-n', f'{pkg}/{PHONE_ACTIVITY}']
+
+
+def forward_command(adb, serial):
+    return [adb, '-s', serial, 'forward', 'tcp:0', PHONE_SOCKET]
+
+
+def forward_remove_command(adb, serial):
+    return [adb, '-s', serial, 'forward', '--remove-all']
+
+
+def parse_forward_port(text):
+    """The port adb picked for `forward tcp:0` (it prints just the number); None when adb said
+    anything else - an error line with a digit in it must not read as a port."""
+    m = re.fullmatch(r'\s*(\d+)\s*', text or '')
+    return int(m.group(1)) if m else None
+
+
+def pick_package(lines):
+    """The app on the phone to raise the receiver on, from `pm list packages org.nxnative`: the shell
+    (the template build, the receiver proper) first, any game app (its own applicationId) otherwise.
+    None means the phone holds no nxnative app yet - the window offers to install the template."""
+    pkgs = [ln.split(':', 1)[1].strip() for ln in lines if ln.strip().startswith('package:')]
+    pkgs = [p for p in pkgs if p == 'org.nxnative' or p.startswith('org.nxnative.')]
+    return SHELL_ID if SHELL_ID in pkgs else (pkgs[0] if pkgs else None)
+
+
+def phone_status(ev):
+    """The receiver-screen message for one PROGRESS=json event of the pipeline; None when the event
+    is not for the phone (say, stage_end)."""
+    kind = ev.get('ev')
+    if kind in ('stage', 'step'):
+        return {'event': 'status', 'state': 'building', 'stage': str(ev.get('name') or ''), 'detail': str(ev.get('step') or '')}
+    if kind == 'progress':
+        det = str(ev.get('step') or '')
+        if ev.get('done') is not None and ev.get('total'):
+            det = f"{ev.get('done'):,} / {ev.get('total'):,}" + (f" {ev.get('unit')}" if ev.get('unit') else '')
+        frac = ev.get('frac')
+        msg = {'event': 'status', 'state': 'building', 'stage': str(ev.get('name') or ''), 'detail': det}
+        if isinstance(frac, (int, float)): msg['pct'] = round(frac * 100)   # absent: the phone's bar goes indeterminate
+        return msg
+    return None
+
+
+def receiver_build_command(gradlew):
+    """The template build - the same Gradle the pipeline runs, with no game staged - for a phone that
+    holds no nxnative app at all."""
+    return [str(gradlew), 'assembleRelease', f'-PDM_APP_ID={SHELL_ID}', '--no-daemon']
+
+
+def find_receiver_apk(android_dir):
+    """The template build's APK: app-release.apk (a machine with dm/android/keystore.properties)
+    or app-release-unsigned.apk - the newer one when both are lying around."""
+    d = Path(android_dir) / 'app' / 'build' / 'outputs' / 'apk' / 'release'
+    cands = [p for p in (d / 'app-release.apk', d / 'app-release-unsigned.apk') if p.exists()]
+    return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+
+class PhoneLink(threading.Thread):
+    """The phone's receiver screen over adb: forward a TCP port onto the app's abstract socket, then
+    JSON lines - hello, the build's stages, the install - with a ping every PING_SECS so both ends
+    know the moment the cable, the app or the computer goes away. Either end dropping is not an
+    error: the link waits and tries again (the auto redetect), and the newest status replaces any
+    queued one, so the screen always shows the last word. It never gates the build or the install."""
+
+    def __init__(self, adb, serial, on_state=lambda live: None, on_ready=None, game=''):
+        super().__init__(daemon=True, name='phone-link')
+        self.adb, self.serial, self.on_state, self.on_ready, self.game = adb, serial, on_state, on_ready, game
+        self.lock = threading.Lock(); self.pending = []
+        self.stop_flag = threading.Event()
+
+    def send(self, obj):
+        with self.lock:
+            if obj.get('event') == 'status':   # a newer status is the only one worth showing
+                self.pending = [m for m in self.pending if m.get('event') != 'status']
+            self.pending.append(obj)
+
+    def stop(self):
+        self.stop_flag.set()
+
+    def run(self):
+        try:
+            while not self.stop_flag.is_set():
+                self.pump()
+                if not self.stop_flag.is_set(): time.sleep(1.5)
+        finally:
+            try: run_out(forward_remove_command(self.adb, self.serial), timeout=10)
+            except Exception: pass
+            self.on_state(False)
+
+    def connect(self):
+        rc, out = run_out(forward_command(self.adb, self.serial), timeout=10)
+        port = parse_forward_port(out) if not rc else None
+        if not port: return None
+        try:
+            sock = socket.create_connection(('127.0.0.1', port), timeout=3)
+            sock.setblocking(False)
+            return sock
+        except OSError:
+            run_out(forward_remove_command(self.adb, self.serial), timeout=10)
+            return None
+
+    def pump(self):
+        sock = self.connect()
+        if not sock: return
+        live = False
+        try:
+            hello = {'event': 'hello'}
+            if self.game: hello['game'] = self.game
+            self._write(sock, hello)
+            self._write(sock, {'event': 'ping'})
+            last_ping = last_pong = time.time()
+            buf = b''
+            while not self.stop_flag.is_set():
+                now = time.time()
+                if now - last_ping >= PING_SECS:
+                    if not self._write(sock, {'event': 'ping'}): break
+                    last_ping = now
+                if now - last_pong > LINK_TIMEOUT: break   # the receiver stopped answering
+                with self.lock:
+                    out, self.pending = self.pending, []
+                if not all(self._write(sock, m) for m in out): break
+                try: r, _, _ = select.select([sock], [], [], 0.2)
+                except (OSError, ValueError): break
+                if sock not in r: continue
+                try: chunk = sock.recv(4096)
+                except (BlockingIOError, InterruptedError): continue
+                except OSError: break
+                if not chunk: break   # the app closed its end (or was replaced by an install)
+                buf += chunk
+                while b'\n' in buf:
+                    line, buf = buf.split(b'\n', 1)
+                    try: msg = json.loads(line.decode('utf-8', 'replace'))
+                    except ValueError: continue
+                    ev = msg.get('event')
+                    if ev == 'pong': last_pong = time.time()
+                    elif ev == 'ready' and self.on_ready: self.on_ready(bool(msg.get('hasGame')))
+                    if not live: live = True; self.on_state(True)   # the receiver answered: it is really there
+        finally:
+            try: sock.close()
+            except OSError: pass
+            run_out(forward_remove_command(self.adb, self.serial), timeout=10)
+            if live: self.on_state(False)
+
+    def _write(self, sock, obj):
+        data = (json.dumps(obj, ensure_ascii=False) + '\n').encode('utf-8')
+        for _ in range(50):   # a full send buffer drains in a moment; never spin for long
+            try:
+                sock.sendall(data); return True
+            except BlockingIOError:
+                time.sleep(0.02)
+            except (OSError, ValueError):
+                return False
+        return False
+
+
 def run_out(cmd, env=None, timeout=None):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
@@ -241,10 +418,16 @@ def run_check(argv):
         print(f"  {'ok  ' if r['ok'] else 'MISS'} {r['name']}: {r['detail']}")
         if not r['ok'] and r['fix']: print(f'        fix: {r["fix"]}')
     dev = list_devices(cfg)
+    adb = adb_path(cfg)
     if dev is None: print('  phone: no adb (the SDK above)')
     elif not dev: print('  phone: none connected - plug it in over USB and enable USB debugging')
     else:
         for serial, state, model in dev: print(f'  phone: {model} ({serial}) {state}')
+        for serial, state, model in [d for d in dev if d[1] == 'device' and adb]:
+            rc, out = run_out([adb, '-s', serial, 'shell', 'pm', 'list', 'packages', 'org.nxnative'], timeout=15)
+            pkg = pick_package(out.splitlines()) if not rc else None
+            print(f'  receiver app on it: {pkg}' if pkg
+                  else '  receiver app: none on this phone - the companion window offers to install the template')
     ok = all(r['ok'] for r in rows)
     print('ready' if ok else 'not ready - see the fixes above')
     return 0 if ok else 1
@@ -266,6 +449,7 @@ def run_gui(argv):
             self.geometry('780x600'); self.minsize(640, 480)
             self.worker = None; self.proc = None; self.devices = []
             self.queue = None
+            self.link = None; self.link_serial = None; self.events = queue.Queue()   # the phone's receiver screen
             f = ttk.Frame(self, padding=10); f.pack(fill='both', expand=True)
 
             ttk.Label(f, text='One game\'s NSPs (base, update, DLC) and the console\'s prod.keys:', ).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
@@ -289,9 +473,12 @@ def run_gui(argv):
 
             state = ttk.Frame(f); state.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(12, 0))
             self.b_phone = tk.Label(state, text='\u25cf ?', fg='#888'); self.b_phone.pack(side='left')
+            self.b_link = tk.Label(state, text='\u25cf receiver: -', fg='#888'); self.b_link.pack(side='left', padx=(10, 0))
             self.b_tools = tk.Label(state, text='\u25cf ?', fg='#888'); self.b_tools.pack(side='left')
             self.b_setup = ttk.Button(state, text='Toolchain\u2026', command=self.open_setup); self.b_setup.pack(side='left', padx=(8, 0))
             self.b_sdk = ttk.Button(state, text='SDK path\u2026', command=self.pick_sdk); self.b_sdk.pack(side='left', padx=(4, 0))
+            # packed only while a phone is plugged in with no nxnative app on it (see drain_events)
+            self.b_recv = ttk.Button(state, text='Install receiver app\u2026', command=self.install_receiver)
 
             self.b_build = ttk.Button(f, text='Build & install', command=self.start)
             self.b_build.grid(row=5, column=0, columnspan=3, sticky='ew', pady=(14, 6))
@@ -332,11 +519,116 @@ def run_gui(argv):
             dev = list_devices(cfg)
             if dev is None:
                 self.b_phone['text'] = '\u25cf no adb'; self.b_phone['fg'] = '#d33'; self.devices = []
+                self.stop_link()
             else:
                 self.devices = [d for d in dev if d[1] == 'device']
-                if self.devices: self.b_phone['text'] = f"\u25cf {self.devices[0][2]} ({self.devices[0][0]})"; self.b_phone['fg'] = '#2a2'
-                else: self.b_phone['text'] = '\u25cf no phone - plug in over USB, enable USB debugging'; self.b_phone['fg'] = '#d33'
+                if self.devices:
+                    serial, model = self.devices[0][0], self.devices[0][2]
+                    self.b_phone['text'] = f'\u25cf {model} ({serial})'; self.b_phone['fg'] = '#2a2'
+                    if serial != self.link_serial:   # plugged in, or a different phone: raise the receiver on it
+                        self.stop_link(); self.link_serial = serial
+                        threading.Thread(target=self.raise_receiver, args=(serial,), daemon=True).start()
+                else:
+                    plugged = [d for d in dev if d[1] != 'device']
+                    self.b_phone['text'] = ('\u25cf plugged in - accept the USB debugging prompt on the phone' if plugged
+                                            else '\u25cf no phone - plug in over USB, enable USB debugging')
+                    self.b_phone['fg'] = '#c80' if plugged else '#d33'
+                    self.stop_link()   # ...and back to "waiting" goes the receiver screen (unplug = replug = raised again)
+            self.drain_events()
             self.after(2000, self.poll_phone)
+
+        def drain_events(self):
+            """The receiver threads (adb calls and the link) never touch the window: they put events
+            here, this tick applies them."""
+            try:
+                while True:
+                    kind, val = self.events.get_nowait()
+                    if kind == 'link':
+                        if self.link: self.link.stop()   # one link at a time
+                        self.link = val; self.link.start()
+                    elif kind == 'pkg':
+                        if val: self.say(f'receiver app on the phone: {val}', 'dim')
+                        else: self.b_recv.pack(side='left', padx=(6, 0))   # nothing to raise: offer the template
+                    elif kind == 'log': self.say(val, 'dim')
+                    elif kind == 'live':
+                        self.b_link['text'] = '\u25cf receiver: live' if val else '\u25cf receiver: off'
+                        self.b_link['fg'] = '#2a2' if val else '#888'
+            except queue.Empty: pass
+
+        def raise_receiver(self, serial):
+            """A worker (adb takes a moment): find the app to raise, am start it, hand the link back
+            through the event queue."""
+            adb = adb_path(cfg)
+            if not adb: return
+            rc, out = run_out([adb, '-s', serial, 'shell', 'pm', 'list', 'packages', 'org.nxnative'], timeout=15)
+            pkg = pick_package(out.splitlines()) if not rc else None
+            self.events.put(('pkg', pkg))
+            if not pkg: return   # the phone holds no nxnative app: the window offers to install the template
+            rc, out = run_out(am_start_command(adb, serial, pkg), timeout=15)
+            if rc: self.events.put(('log', out.strip()[-200:]))
+            self.events.put(('link', PhoneLink(adb, serial, on_state=lambda live: self.events.put(('live', live)))))
+
+        def stop_link(self):
+            if self.link: self.link.stop(); self.link = None
+            self.link_serial = None
+            self.b_link['text'] = '\u25cf receiver: -'; self.b_link['fg'] = '#888'
+            self.b_recv.pack_forget()
+
+        def phone(self, obj):
+            """The build's word to the phone's screen; queued, never blocking, dropped when nobody
+            is listening (the link is content, not a step)."""
+            link = self.link
+            if link and obj: link.send(obj)
+
+        def install_receiver(self):
+            if self.worker and self.worker.is_alive(): return
+            rows = tool_report(cfg); miss = [r['name'] for r in rows if not r['ok']]
+            if miss and not messagebox.askyesno('Toolchain', 'These are missing: ' + ', '.join(miss) + '\n\nStart anyway?', parent=self): return
+            self.b_recv.pack_forget(); self.b_build['state'] = 'disabled'
+            self.queue = self.queue or queue.Queue()
+            self.worker = threading.Thread(target=self.receiver_install, daemon=True)
+            self.worker.start(); self.after(100, self.drain)
+
+        def receiver_install(self):
+            """The template build for a phone with no nxnative app on it: the same Gradle the games
+            go through (no game staged, the shell's applicationId), then the same align-sign-install."""
+            q = self.queue
+            android = REPO / 'dm' / 'android'
+            gradlew = android / ('gradlew.bat' if os.name == 'nt' else 'gradlew')
+            try:
+                if not gradlew.exists(): raise RuntimeError('no gradlew in the checkout: ' + str(android))
+                env = dict(os.environ)
+                if cfg.get('sdk'): env['ANDROID_HOME'] = cfg['sdk']
+                env['GAME'] = PROFILE   # the host compiles against a committed profile (the template carries no game files; the same GAME the CI workflow sets)
+                cmd = receiver_build_command(gradlew)
+                q.put(('stage', 'building the receiver app (the empty template, no game in it)'))
+                self.proc = subprocess.Popen(cmd, cwd=str(android), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                for line in self.proc.stdout or []: q.put(('log', line.rstrip()))
+                rc = self.proc.wait(); self.proc = None
+                if rc: raise RuntimeError(f'the template build stopped with exit code {rc} (the lines above say why)')
+                apk = find_receiver_apk(android)
+                if not apk: raise RuntimeError('the build left no APK in app/build/outputs/apk/release')
+                q.put(('log', f'the build wrote {apk.name}', 'dim'))
+                bt = bt_dir(cfg.get('sdk') or os.environ.get('ANDROID_HOME', ''))
+                if not bt: raise RuntimeError('no build-tools 35 in the SDK: open Toolchain and install it')
+                ks, cfg2 = ensure_keystore(cfg, log=lambda m: q.put(('log', m, 'dim')))
+                aligned = apk.with_suffix('.aligned.apk')
+                rc, out = run_out(zipalign_command(bt, apk, aligned))
+                if rc: raise RuntimeError('zipalign failed: ' + out.strip()[-300:])
+                rc, out = run_out(apksigner_command(bt, ks, cfg2['store_password'], cfg2['key_password'], cfg2['alias'], aligned, apk))
+                aligned.unlink(missing_ok=True)
+                if rc: raise RuntimeError('signing failed: ' + out.strip()[-300:])
+                adb = adb_path(cfg)
+                serial = self.devices[0][0] if self.devices else None
+                if not adb or not serial:
+                    q.put(('done', f'built and signed the receiver app: {apk}\nno phone right now - when one is plugged in: adb install -r "{apk}"'))
+                    return
+                q.put(('stage', 'installing the receiver app\u2026'))
+                rc, out = run_out(adb_install_command(adb, serial, apk), timeout=600)
+                if rc: raise RuntimeError('adb install failed: ' + out.strip()[-300:])
+                q.put(('done', 'the receiver app is installed - its icon is on the home screen. Plug the phone in again (or wait a moment) and the companion takes over'))
+            except Exception as e:
+                q.put(('fail', str(e)))
 
         # -- the setup window: the guided list, each miss with its fix and an Install button where one click can do it --
         def open_setup(self):
@@ -389,16 +681,25 @@ def run_gui(argv):
             if cfg.get('sdk'): env['ANDROID_HOME'] = cfg['sdk']
             cmd = pipeline_command(nsp, keys, lang, fps, app_name)
             q.put(('stage', f'building: {" ".join(cmd[1:])}'))
+            self.phone({'event': 'status', 'state': 'building', 'stage': 'starting', 'detail': os.path.basename(nsp)})
             try:
                 self.proc = subprocess.Popen(cmd, cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                last_stage = ''
                 for line in self.proc.stdout or []:
                     ev = None
                     try: ev = json.loads(line)
                     except ValueError: pass
                     if ev and ev.get('ev') in ('stage', 'step'):
+                        if ev.get('name'): last_stage = str(ev['name'])
                         q.put(('stage', f"[{ev.get('k', '?')}/{ev.get('n', '?')}] {ev.get('name', '')} \u00b7 {ev.get('step', '')}"))
                         if ev.get('step'): q.put(('log', ev['step'], 'dim'))
-                    elif ev and ev.get('ev') == 'say': q.put(('log', str(ev.get('msg', ''))))
+                        self.phone(phone_status(ev))
+                    elif ev and ev.get('ev') == 'progress':
+                        self.phone(phone_status(ev))   # the shader counts: the phone's bar lives on these
+                        q.put(('log', line.rstrip()))
+                    elif ev and ev.get('ev') == 'say':
+                        q.put(('log', str(ev.get('msg', ''))))
+                        self.phone({'event': 'status', 'state': 'building', 'stage': last_stage, 'detail': str(ev.get('msg', ''))})
                     else: q.put(('log', line.rstrip()))
                 rc = self.proc.wait(); self.proc = None
                 if rc: raise RuntimeError(f'the build stopped with exit code {rc} (the lines above say why)')
@@ -424,12 +725,16 @@ def run_gui(argv):
                 elif not serial:
                     q.put(('done', f'built and signed {apk.name} - no phone connected right now: connect it and run\n  adb install -r "{apk}"'))
                 else:
+                    game = apk.stem
+                    self.phone({'event': 'status', 'state': 'installing', 'game': game})
                     q.put(('stage', f'installing on {self.devices[0][2]}\u2026'))
                     rc, out = run_out(adb_install_command(adb, serial, apk), timeout=600)
                     if rc: raise RuntimeError('adb install failed: ' + out.strip()[-300:] + ' (USB debugging: the phone must show the trust prompt)')
+                    self.phone({'event': 'status', 'state': 'done', 'game': game})   # the shell app survives a game's install; a same-app update closes its own link
                     q.put(('done', f'installed on {self.devices[0][2]} - the game\'s icon is on the home screen'))
             except Exception as e:   # the worker never takes the window down: the reason goes to the log
                 q.put(('fail', str(e)))
+                self.phone({'event': 'status', 'state': 'error', 'message': str(e).strip()[-300:]})
         def drain(self):
             try:
                 while True:

@@ -199,6 +199,23 @@ To play on a Mac with Apple silicon instead, `--platform mac-app` packs a Mac ap
 
 With an Apple developer account you can instead build and install from Xcode: `--prepare-xcode` makes an Xcode project for the game rather than an IPA ([Build and run on a device with Xcode](docs/development.md#build-and-run-on-a-device-with-xcode)).
 
+## Play on Android
+
+The same approach on an Android phone: the game's own code runs natively on its ARM chip, Switch graphics rebuilt on Vulkan ([dm/android](dm/android)). A game is packed on the computer as its own APK and installed over USB — nothing of any game is in this repository, and nothing is downloaded onto the phone.
+
+**1. On the computer** (Linux, macOS, or Windows inside WSL2), run the PC companion: it checks the whole toolchain (Java 17+, the Android SDK with its NDK and CMake, .NET, the Python packages) and explains exactly how to install whatever is missing, then watches for the phone over USB.
+
+```
+git clone https://github.com/touhidsiddiqueeraj-bit/nxnative.git && cd nxnative
+python3 dm/android/tools/pc_companion.py
+```
+
+**2. On the phone**, turn on USB debugging (Settings, About phone, tap Build number seven times; then Settings, Developer options, USB debugging) and plug it in. The **receiver screen** rises on the phone: it shows the connection, then follows the build live — every stage, the shader counts, the install — and ends with "installed, tap the game's icon". It needs the receiver app on the phone once: when there is none, the companion offers to build and install it (the empty template, `org.nxnative.shell`; every game then lands beside it as its own app). Unplugging drops the screen back to "waiting for the computer"; plugging in again raises it back — no restarts, no taps.
+
+**3. Pick the game's NSPs and `prod.keys` on the computer and press Build & install.** The companion runs the same pipeline as the Mac build, then aligns the APK for 16 KB-page phones, signs it with a personal key made on first use (so every later build of the same game installs over the last), and installs it. The game's icon lands on the home screen; the player taps it — nothing is launched for them. The first build of a game takes half an hour or more (the shaders); a rebuild of what did not change takes about a minute.
+
+Needs Android 10 or later, an arm64 phone with a Vulkan 1.1 GPU (4 GB of memory or more for the bigger games). On-device testing so far concentrated on Super Mario Bros. Wonder on a 16 KB-page Xiaomi; the game profiles are the same as the Mac's, so the same caveats about untested versions apply.
+
 ## Play
 
 **Settings.** A screen before the game starts offers what the game supports: frame rate, render scale, docked or handheld mode, game language, the frame-rate counter and rumble. Everything is on one scrollable screen, grouped into **Game**, **Controls** and **Performance**, with menus, sliders and a reset to the settings the game was tested with. Tap **Play** to start; the app remembers your choices. What each setting does: [Settings](docs/settings.md).

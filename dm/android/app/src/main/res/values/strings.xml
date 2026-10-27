@@ -4,7 +4,14 @@
     <string name="reset_defaults">Reset to tested defaults</string>
     <string name="reset_footer">Brings back all settings this game was tested with.</string>
     <string name="memory_available">Memory available</string>
-    <string name="no_game_files">Game files not found.\nPack an APK with scripts/build_apk_from_nsp.py and install it again.</string>
+    <string name="receiver_tagline">game receiver</string>
+    <string name="receiver_waiting">Waiting for the computer…</string>
+    <string name="receiver_connected">Computer connected</string>
+    <string name="receiver_connected_hint">Pick the game\'s NSPs and prod.keys on the computer - this screen follows the build.</string>
+    <string name="receiver_installing">Installing %1$s…</string>
+    <string name="receiver_installed">%1$s is installed - its icon is on the home screen. Tap it to play.</string>
+    <string name="receiver_failed">The build on the computer stopped.</string>
+    <string name="receiver_usb_steps">To receive a game:\n\n1. Plug this phone into the computer with a USB cable.\n2. On the computer, run the nxnative companion (dm/android/tools/pc_companion.py).\n\nIf the computer cannot see the phone, USB debugging needs to be on: Settings, About phone, tap Build number seven times, then Settings, Developer options, USB debugging. A prompt appears on the phone the first time - accept it.</string>
     <string name="load_failed">The host library did not load:\n%1$s</string>
     <string name="save_failed_title">Save failed</string>
     <string name="save_failed_enospc">Storage is full, so progress was not saved. Free up space and save again.</string>

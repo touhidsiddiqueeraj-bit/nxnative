@@ -63,11 +63,10 @@ class MainActivity : Activity(), ProgressOverlay.Host {
         if (HostJni.nativeBoot(DmFront, files, romfs,
                 File(filesDir, "aoc").takeIf { it.isDirectory }?.absolutePath,
                 File(filesDir, "pso").takeIf { it.isDirectory }?.absolutePath) != 0) {
-            val hint = TextView(this).apply {
-                text = getText(R.string.no_game_files)
-                setTextColor(Color.WHITE); gravity = Gravity.CENTER; setPadding(48, 48, 48, 48)
-            }
-            root.addView(hint)
+            // The empty shell (the template APK) or a stripped build: the receiver screen is the app
+            // until a game is installed into it from the PC companion over USB
+            startActivity(Intent(this, ReceiverActivity::class.java))
+            finish()
             return
         }
         controllers = GamepadInput(this)

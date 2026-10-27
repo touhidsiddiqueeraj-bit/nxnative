@@ -25,6 +25,15 @@
             android:screenOrientation="userLandscape"
             android:theme="@style/Theme.DmGame.Launcher" />
 
+        <!-- What an empty shell shows, and what the PC companion raises over USB
+             (adb shell am start) the moment the phone is plugged in: exported has to be
+             true for the shell to start it, and it carries no intent filter, so nothing
+             else can reach it -->
+        <activity
+            android:name=".ReceiverActivity"
+            android:exported="true"
+            android:theme="@style/Theme.DmGame" />
+
         <activity
             android:name=".MainActivity"
             android:exported="true"
