@@ -30,9 +30,9 @@ import build_ipa_from_nsp as ios   # the shared stages: identification, extracti
 from build_ipa_from_nsp import (BuildError, PROG, say, run, rmtree, scan_nsps, decompress_nsz, build_nx_extract,
                                 extract, extract_aoc, rewrite, split_shaders, pick_nsps, nsp_versions, vnum,
                                 language_code, game_language, ask, in_ipython, find_repo, check_prereqs, chain_of,
-                                same_build, survey, write_profile, derive_profile, heap_check, heap_checked,
+                                same_build, survey, write_profile, derive_profile,
                                 provisional_prep, refine_after_rewrite, report_profile_status, can_clone,
-                                free_gb, tree_size, amount)
+                                amount)
 
 
 def parse_args(argv):
@@ -153,7 +153,7 @@ def main(args):
     # ---- the shaders: the chain's SPIR-V ----
     sh = work / 'shader'
     sv = versions if derived else need
-    pkey = split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, bool(provisional or derived), None, sorted(p for p in aoc.iterdir() if p.is_dir()) if aoc else [], None)
+    split_shaders(py, repo, [dirs[v] / 'RomFS' for v in sv], [dirs[v] / 'ExeFS/main' for v in sv], sh / 'pkg', env, logs, g, bool(provisional or derived), None, sorted(p for p in aoc.iterdir() if p.is_dir()) if aoc else [], None)
     chain = chain_of(repo)
     spv = work / 'build' / 'android' / 'spv'
     PROG.stage('SPIR-V shaders')
@@ -181,7 +181,7 @@ def main(args):
     if args.no_keep_extracted:
         say(f'deleting the extracted game files: {ex}'); rmtree(ex)
     say(f'done: {out_apk} ({out_apk.stat().st_size / 2**30:.2f} GB); install with adb install -r {out_apk}')
-    say(f'the app\'s files land in its private storage on first start; its log is in Android/data (log.txt), its saves in files/save')
+    say("the app's files land in its private storage on first start; its log is in Android/data (log.txt), its saves in files/save")
     report_profile_status(g, g, pkg_ver, derived, provisional)
 
 

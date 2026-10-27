@@ -46,7 +46,7 @@ jobs:
         with:
           python-version: '3.12'
       - name: Install the tools' Python dependencies
-        run: python3 -m pip install lz4 capstone fonttools
+        run: python3 -m pip install pytest lz4 capstone fonttools
       - name: Android tool tests
         run: python3 -m pytest dm/android/tests -q
       - name: The pipeline script parses
