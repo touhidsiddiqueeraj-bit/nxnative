@@ -250,14 +250,27 @@ JNIEXPORT jint JNICALL Java_org_nxnative_android_HostJni_nativeBoot(JNIEnv *env,
     if (g_front) (*env)->DeleteGlobalRef(env, g_front);
     g_front = (*env)->NewGlobalRef(env, front);
     jclass c = (*env)->GetObjectClass(env, g_front);
-    g_m.progress = (*env)->GetMethodID(env, c, "progress", "(Ljava/lang/String;JJ)V");
-    g_m.text_input = (*env)->GetMethodID(env, c, "textInput", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;");
-    g_m.save_failed = (*env)->GetMethodID(env, c, "saveFailed", "(I)V");
-    g_m.thermal = (*env)->GetMethodID(env, c, "thermal", "()I");
-    g_m.low_power = (*env)->GetMethodID(env, c, "lowPower", "()I");
-    g_m.brightness = (*env)->GetMethodID(env, c, "brightness", "()D");
-    g_m.screen_fps = (*env)->GetMethodID(env, c, "screenFps", "()I");
-    g_m.haptic = (*env)->GetMethodID(env, c, "haptic", "(IFF)V");
+    // The lookups go one by one, each checked: a miss (a rebuilt app, a renamed method) logs and
+    // leaves that one slot empty - every call site falls back on a null slot - instead of a pending
+    // NoSuchMethodError that would crash the app the moment nativeBoot returns. The signatures
+    // must spell DmFront.kt exactly: haptic takes (player, on, amplitude, sharpness) = (IIFF)V.
+    static const struct { const char *name, *sig; jmethodID *slot; } lookups[] = {
+        {"progress",   "(Ljava/lang/String;JJ)V", &g_m.progress},
+        {"textInput",  "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/String;", &g_m.text_input},
+        {"saveFailed", "(I)V", &g_m.save_failed},
+        {"thermal",    "()I", &g_m.thermal},
+        {"lowPower",   "()I", &g_m.low_power},
+        {"brightness", "()D", &g_m.brightness},
+        {"screenFps",  "()I", &g_m.screen_fps},
+        {"haptic",     "(IIFF)V", &g_m.haptic},
+    };
+    for (size_t i = 0; i < sizeof lookups / sizeof *lookups; i++) {
+        *lookups[i].slot = (*env)->GetMethodID(env, c, lookups[i].name, lookups[i].sig);
+        if ((*env)->ExceptionCheck(env)) {
+            LOGE("boot: DmFront.%s%s not found, continuing without it", lookups[i].name, lookups[i].sig);
+            (*env)->ExceptionClear(env);
+        }
+    }
     pthread_mutex_unlock(&g_front_mu);
     g_boot_ok = boot_env(env, romfs, aoc, pso);
     dm_haptics_init(dm_haptics_android_sink, 1);   // the host's rumble pipeline; the launcher's switches scale it in the sink
