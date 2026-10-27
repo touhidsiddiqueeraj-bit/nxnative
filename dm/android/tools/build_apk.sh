@@ -78,7 +78,9 @@ t "gradle (assembleRelease, the NDK builds the host)"
 ( cd "$ANDROID" && ./gradlew assembleRelease -PDM_APP_ID="$DM_APP_ID" -PDM_APP_NAME="$DM_DISPLAY_NAME" -PDM_APP_VERSION="$DM_APP_VERSION" -PDM_STAGED="$STAGED" --no-daemon ) \
   > "$W/build/android/gradle.log" 2>&1 \
   || { grep -E 'error:|error |FAILED|FAILURE' "$W/build/android/gradle.log" | head -20; die "gradle, log $W/build/android/gradle.log"; }
+# a machine with dm/android/keystore.properties signs in Gradle, so the output carries no -unsigned
 APK=$ANDROID/app/build/outputs/apk/release/app-release-unsigned.apk
-[ -f "$APK" ] || die "no built APK at $APK"
+[ -f "$APK" ] || APK=$ANDROID/app/build/outputs/apk/release/app-release.apk
+[ -f "$APK" ] || die "no built APK at $ANDROID/app/build/outputs/apk/release/"
 cp "$APK" "$OUT_APK" || die "copy to $OUT_APK"
 t "done: $OUT_APK ($(du -h "$OUT_APK" | cut -f1)) — install with 'adb install -r', or take a signed release from the CI workflow"

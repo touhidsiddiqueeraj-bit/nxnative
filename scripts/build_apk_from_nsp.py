@@ -45,6 +45,7 @@ def parse_args(argv):
     ap.add_argument('-l', '--language', help='game language, a code or a name: ja, fr, de, es, zh-Hans, zh-Hant, ko, Japanese, ... (default: English)')
     ap.add_argument('-p', '--package', help='version packed into the APK (default: the newest in the folder)')
     ap.add_argument('--show-fps', action='store_true', default=None, help='show the game\'s frame rate on the phone (default: on)')
+    ap.add_argument('--no-show-fps', action='store_false', dest='show_fps', help='hide the frame-rate counter (default: on)')
     ap.add_argument('--survey-only', action='store_true', help='only write the survey of a game with no profile')
     ap.add_argument('--provisional', action='store_true', help='build from a provisional profile even when dm/games has one')
     ap.add_argument('--no-keep-extracted', action='store_true', help='delete the extracted game files after the APK is built')
@@ -108,7 +109,7 @@ def main(args):
     env.update(DM_GAME=g.id, DM_ROOT=str(work), WORK=str(work / 'tmp'))
     logs = work / 'logs'
     xlate = repo / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
-    check_prereqs(env, xlate, mac=False)
+    check_prereqs(env, xlate, android=True)
     picks = pick_nsps(fam, have, versions)
 
     # ---- extract, rewrite ----
