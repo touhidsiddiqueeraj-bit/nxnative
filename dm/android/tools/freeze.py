@@ -33,7 +33,6 @@ NAME = 'nxcompanion'
 # are walked dynamically or lazily, and backports.zstd is imported from a try/except in shader_split.py.
 HIDDEN = ['lz4.block', 'lz4.frame'] + (['compression.zstd'] if sys.version_info >= (3, 14) else [])
 COLLECT = ['capstone', 'fontTools', 'nsz'] + ([] if sys.version_info >= (3, 14) else ['backports.zstd'])
-FATTEN = ['lz4', 'capstone', *COLLECT, 'pycryptodome']   # the ones that may carry a native module (nsz pulls pycryptodome)
 
 
 def pyinstaller():
@@ -44,41 +43,55 @@ def pyinstaller():
     return r.stdout.strip()
 
 
-def fatten(packages):
-    """Make the installed native modules universal2, in place: PyInstaller's universal2 build refuses
-    a thin .so, and on the Mac some of the pipeline's wheels ship one arch only (lz4 and the zstd
-    backport; capstone and pycryptodome are fat already). The other arch's wheel is fetched from
-    PyPI and lipo'd into the installed file. Returns False (and says why) when a thin one has no
-    other-arch wheel: the build then cannot be universal2."""
-    import importlib.util, json, tempfile, urllib.request, zipfile
+def fatten():
+    """Make every installed native module universal2, in place: PyInstaller's universal2 build
+    refuses a thin .so/.dylib, and on the Mac most of the pipeline's wheels ship one arch only
+    (lz4, capstone, the zstd backport, zstandard - an nsz dependency; a hand list lost track of
+    the last one, so this walks site-packages itself). Each thin module's other arch is fetched
+    from its PyPI wheel and lipo'd into the installed file. Returns False (and says why) when a
+    thin one has no other-arch wheel: the build then cannot be universal2."""
+    import importlib.metadata as md, json, sysconfig, tempfile, urllib.request, zipfile
     other = 'x86_64' if platform.machine() == 'arm64' else 'arm64'
     py = f'cp{sys.version_info.major}{sys.version_info.minor}'
-    for pkg in packages:
-        spec = importlib.util.find_spec(pkg)
-        if spec is None or not spec.submodule_search_locations: continue
-        root = Path(spec.submodule_search_locations[0])
-        thin = [so for pat in ('*.so', '*.dylib') for so in root.rglob(pat)   # capstone ships a .dylib
-                if other not in subprocess.run(['lipo', '-info', str(so)], capture_output=True, text=True).stdout]
+    site = Path(sysconfig.get_paths()['purelib'])
+    dists = md.packages_distributions()
+    lipo = lambda f: subprocess.run(['lipo', '-info', str(f)], capture_output=True, text=True).stdout
+    thin_left = []
+    for top in sorted(site.iterdir()):
+        if not top.is_dir(): continue
+        thin = [so for pat in ('*.so', '*.dylib') for so in top.rglob(pat)   # capstone ships a .dylib
+                if other not in lipo(so)]
         if not thin: continue
-        with urllib.request.urlopen(f'https://pypi.org/pypi/{pkg}/json', timeout=30) as f:
-            files = json.load(f)['urls']
-        cand = [f for f in files if f['filename'].endswith(f'_{other}.whl') and 'macosx' in f['filename']
-                and (py in f['filename'] or 'py3-none' in f['filename'] or 'abi3' in f['filename'])]
-        if not cand:
-            print(f'fatten: {pkg} has thin native modules but no {other} wheel on PyPI', file=sys.stderr)
-            return False
-        with tempfile.TemporaryDirectory() as tmp:
-            wheel = Path(tmp) / cand[0]['filename']
-            with urllib.request.urlopen(cand[0]['url'], timeout=300) as r: wheel.write_bytes(r.read())
-            with zipfile.ZipFile(wheel) as z: z.extractall(tmp)
-            tree = Path(tmp).joinpath(*pkg.split('.'))
-            for so in thin:
-                merge = Path(str(so) + '.fat')
-                r = subprocess.run(['lipo', '-create', str(so), str(tree / so.relative_to(root)), '-o', str(merge)])
-                if r.returncode or not merge.is_file():
-                    print(f'fatten: lipo refused {so}', file=sys.stderr); return False
-                shutil.move(merge, so)
-        print(f'fatten: {pkg} is universal2 now ({len(thin)} native module(s) merged)')
+        names = [d for d in dists.get(top.name, []) if d]
+        merged = False
+        for name in dict.fromkeys(names):   # two dists can own the same import (a venv's real one beside a fake): merge once
+            try:
+                ver = md.version(name)   # the installed one: its other-arch wheel has the same layout and version
+                with urllib.request.urlopen(f'https://pypi.org/pypi/{name}/{ver}/json', timeout=30) as f:
+                    files = json.load(f)['urls']
+                cand = [f for f in files if f['filename'].endswith(f'_{other}.whl') and 'macosx' in f['filename']
+                        and (py in f['filename'] or 'py3-none' in f['filename'] or 'abi3' in f['filename'])]
+                if not cand: continue
+                with tempfile.TemporaryDirectory() as tmp:
+                    wheel = Path(tmp) / cand[0]['filename']
+                    with urllib.request.urlopen(cand[0]['url'], timeout=300) as r: wheel.write_bytes(r.read())
+                    with zipfile.ZipFile(wheel) as z: z.extractall(tmp)
+                    tree = Path(tmp) / top.name   # a wheel unpacks under the import's own top-level folder
+                    for so in thin:
+                        piece = tree / so.relative_to(top)
+                        if not piece.is_file(): continue
+                        fat = Path(str(so) + '.fat')
+                        if subprocess.run(['lipo', '-create', str(so), str(piece), '-o', str(fat)]).returncode: continue
+                        shutil.move(fat, so); merged = True
+            except (OSError, ValueError, zipfile.BadZipFile): continue   # no such project or no wheel: try the next name
+        if merged:
+            still = [so for so in thin if other not in lipo(so)]
+            print(f'fatten: {top.name} is universal2 now ({len(thin) - len(still)} native module(s) merged)')
+            thin = still
+        if thin: thin_left.append(top.name)
+    if thin_left:
+        print(f'fatten: thin native modules remain in {thin_left}: no {other} wheel on PyPI for them', file=sys.stderr)
+        return False
     return True
 
 
@@ -91,7 +104,7 @@ def main(argv):
     windowed = sys.platform in ('win32', 'darwin')
     universal = False
     if sys.platform == 'darwin':
-        universal = fatten(FATTEN)   # the wheel-makers' thin native modules get their other arch
+        universal = fatten()   # the wheel-makers' thin native modules get their other arch
         if not universal: sys.exit('the universal2 Mac build needs every native module fat (see fatten above)')
     cmd = [sys.executable, '-m', 'PyInstaller', '--onefile', '--noconfirm', '--clean',
            '--name', NAME, '--distpath', str(out), '--workpath', str(REPO / 'build' / 'nxcompanion'),
