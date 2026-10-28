@@ -95,8 +95,12 @@ do not allow growth.
 tests, then Gradle/NDK against a committed game profile, with the 16 KB-page
 checks on the APK), and on a `v*` tag attaches the release APK to the GitHub
 release. `.github/workflows/pc-companion.yml` builds the PC companion's
-standalone executables — one job per platform (Linux, Windows, a universal2
-macOS build) — and attaches them to the same releases.
+standalone apps — one job per platform (Linux, Windows, a universal2 macOS
+build), each carrying the build-engine payload — and attaches them to the same
+releases. Each job also smokes what it froze: the `--check` report runs (and
+unpacks the payload it carries), the payload's own pipeline script runs inside
+the executable as python3 would run it, and the third-party modules and a
+spawn pool run in it too.
 
 ## The PC companion
 
@@ -128,23 +132,36 @@ per platform. What the freeze does beyond the default:
 - On Windows a window app's console children (adb, java, gradlew, …) each
   flash their own console window: every subprocess carries
   `CREATE_NO_WINDOW` (`NO_WINDOW` in the companion and the pipeline's `run()`).
-- The repository stays outside the executable: a standalone build finds it
-  through its config, `NXC_REPO`, the executable's folder or the working
-  directory (`repo_dir`), and the Toolchain page shows it as a row when it
-  is missing. bash, make, python3, zstd, dotnet, Java and the Android SDK
-  stay outside as well — the window guides their installation.
+- The build engine travels inside the app: `payload.zip` beside the executable
+  (in `_internal`, or the .app's `Contents/Resources` on the Mac) carries every
+  file git tracks except the docs and the CI workflows, with git's modes
+  (gradlew and the Mac translator binaries keep their execute bit even when the
+  zip is built on a Windows runner, whose disk cannot hold one). On first use
+  the app unpacks it once into `~/.nxcompanion/repo/<version>`
+  (`ensure_payload`): a stamp marks the complete tree, a leftover `.tmp` of a
+  killed run is redone from scratch, and the engine of an older version goes
+  away. `repo_dir` then hands that folder out as the repository — `--repo` (or
+  the config's folder) still points the app at a checkout instead, and a build
+  dropped into one still finds it; the Toolchain page shows the engine as a
+  row, so a broken bundle says "re-download" instead of failing mid-build.
+- bash, make, python3, zstd, dotnet, Java and the Android SDK stay outside:
+  the window guides their installation.
 
 `freeze.py`'s module lists are checked against the pipeline's actual imports by
-`test_pc_companion.py`'s `FreezeLists`, so a new third-party import cannot reach
-users as a run-time failure of the standalone build only. The Mac build is
-universal2, matching the repository's own translator binaries — the wheel
-makers' thin native modules (lz4, the zstd backport) get their other arch
-lipo'd in first, from the other arch's PyPI wheel (`fatten` in freeze.py).
-The Windows build is a window app in a folder (`nxcompanion.exe` with
-`_internal` beside it, not one file: a onefile child re-extracts the whole
-bundle for every process it starts, and Defender's real-time scan turns the
-shader split's dozens of workers into minutes of dead time each); `--check`
-attaches to the terminal it was run from. The Linux build is a console one.
+`test_pc_companion.py`'s `FreezeLists` (which also checks the payload: the
+whole tracked tree minus the docs and the workflows, `gradlew` executable), so
+a new third-party import cannot reach users as a run-time failure of the
+standalone build only. The Mac build is universal2, matching the repository's
+own translator binaries — the wheel makers' thin native modules (lz4, the
+zstd backport) get their other arch lipo'd in first, from the other arch's
+PyPI wheel (`fatten` in freeze.py). Every platform builds as a folder app
+(onedir; the Mac's is the .app's own bundle): a onefile child re-extracts the
+whole bundle for every process it starts — on Windows, Defender's real-time
+scan turns the shader split's dozens of workers into minutes of dead time each
+— and a folder starts every process instantly, besides giving the payload a
+place to sit where it cannot be separated from the executable. On Windows the
+build is a window app (`--check` attaches to the terminal it was run from);
+on Linux, a console one.
 
 ## The packing script in detail
 

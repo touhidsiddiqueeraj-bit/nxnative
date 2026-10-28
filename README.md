@@ -205,7 +205,7 @@ The same approach on an Android phone: the game's own code runs natively on its 
 
 **1. On the computer** (Linux, macOS, or Windows), run the PC companion: it checks the whole toolchain (Java 17+, the Android SDK with its NDK and CMake, .NET, the Python packages) and explains exactly how to install whatever is missing, then watches for the phone over USB. Two ways to get it:
 
-- **The standalone build**: download `nxcompanion` for your platform from the [Releases page](https://github.com/touhidsiddiqueeraj-bit/nxnative/releases) — one file to unpack on macOS or Linux, a folder on Windows (`nxcompanion.exe` and `_internal` beside it) — with the window and the whole build pipeline inside, no Python of your own needed for it. Drop it into the repository, or start it anywhere and pick the repository folder once (the **Repository** button): the build runs inside it.
+- **The standalone build** (the easy one): download `nxcompanion` for your platform from the [Releases page](https://github.com/touhidsiddiqueeraj-bit/nxnative/releases) — the app is self-contained: the window, the whole build pipeline *and the build engine itself* (the repository's scripts, profiles, Gradle project and shader toolchain as `payload.zip` beside the executable) all travel inside. Unpack it anywhere, run it, press Build; on first use it unpacks its engine once into `~/.nxcompanion/repo/<version>` and runs every build from there. No Python of your own, no checkout, nothing else of the project to download. macOS gets `nxcompanion.app` (universal2), Linux a folder with `./nxcompanion`, Windows a folder with `nxcompanion.exe` (and `_internal` beside it — keep the folder together).
 - **From source**: a Python 3.10+ that needs nothing installed for the window itself.
 
 ```

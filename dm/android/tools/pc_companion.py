@@ -13,16 +13,18 @@ the build's stages stream to it live (adb forward onto the app's localabstract:n
 player watches the game arrive on the phone they will play it on. It is the screen's content, never
 a step the build waits on: pull the cable mid-build and everything on the computer still finishes.
 
+A standalone build (the Releases page; dm/android/tools/freeze.py) is one app that needs nothing
+else of the project: it carries the whole build engine as payload.zip beside the executable (every
+file git tracks, but the docs and the CI workflows), unpacks it once into ~/.nxcompanion/repo/<version>
+and runs the pipeline from there. --repo still points it at a checkout instead, for development.
+What every build wants from the machine itself - Java, the Android SDK, .NET, bash, make, python3,
+zstd - the Toolchain page checks and guides in. Windows: the window runs by itself; the build steps
+want bash, make and python3 (MSYS2 provides them, or the whole build inside WSL2), and adb sees a
+USB phone once usbipd-win attaches it (the toolchain page has the commands).
+
 Usage (Python 3.10+, no pip packages needed for the window itself):
     python3 dm/android/tools/pc_companion.py          the window
     python3 dm/android/tools/pc_companion.py --check  the same toolchain and device report on stdout
-The standalone builds (the Releases page; dm/android/tools/freeze.py) are the same app with its
-own Python inside - nxcompanion for Linux, the Mac and Windows - and the build pipeline runs in
-them too: they still need the repository (the pipeline, the translator and the app's build files
-live there), so run the executable inside a checkout or point it at one once (--repo, or the
-Repository button in the window). Windows: the window runs by itself; the build steps want bash,
-make and python3 (MSYS2 provides them, or the whole build inside WSL2), and adb sees a USB phone
-once usbipd-win attaches it (the toolchain page has the commands).
 """
 import argparse
 import json
@@ -39,14 +41,15 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from pathlib import Path
 
 FROZEN = hasattr(sys, 'frozen')   # a standalone build (dm/android/tools/freeze.py): this file is the app, not a checkout
 REPO = Path.cwd() if FROZEN else Path(__file__).resolve().parents[3]
-   # from source: the checkout this file lives in; a standalone build finds the repository another way
-   # (repo_dir: the config's folder, NXC_REPO, the executable's folder or the working directory - its
-   # __file__ is inside the build's own bundle, not a checkout, and has no repository around it)
-VERSION = '1.0.0'   # the standalone builds' version (freeze.py names the releases after it)
+   # from source: the checkout this file lives in; a standalone build carries its own copy of the
+   # repository instead (the payload: payload.zip beside the executable, unpacked into
+   # ~/.nxcompanion/repo/<version> on first use - see ensure_payload - and found by repo_dir)
+VERSION = '1.1.0'   # the standalone builds' version (freeze.py names the releases after it)
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if (sys.platform == 'win32' and FROZEN) else 0
    # the standalone Windows build is a window app: without the flag every console child it spawns
    # (adb, java, gradlew, ...) flashes its own console window; the output flows through the pipes as before
@@ -111,6 +114,67 @@ def _is_repo_dir(p):
     return (p / 'scripts' / 'build_apk_from_nsp.py').is_file() and (p / 'dm' / 'android').is_dir()
 
 
+# ---- The payload: the repository a standalone build carries inside itself ----
+
+def payload_zip():
+    """The zip a standalone build unpacked its repository from: beside the executable (a folder
+    build keeps it in _internal, the Mac app in Resources). None when this is no such build or
+    the file went missing - the toolchain report says which, and ensure_payload says it again."""
+    if not FROZEN: return None
+    exe = Path(sys.executable).resolve()
+    for cand in (exe.parent / '_internal' / 'payload.zip',   # the folder build's own place
+                 exe.parent / 'payload.zip',                  # dropped there by hand
+                 exe.parent.parent / 'Resources' / 'payload.zip'):   # the Mac app's Contents/Resources
+        if cand.is_file(): return cand
+    return None
+
+
+def payload_home():
+    """Where the payload unpacks: ~/.nxcompanion/repo/<version> - versioned, so a new app replaces
+    its old engine (and nothing else of the user's is touched)."""
+    return CONFIG_DIR / 'repo' / VERSION
+
+
+def payload_ready():
+    """True once the payload has unpacked (the stamp the unpacking leaves behind)."""
+    return (payload_home() / '.payload').is_file()
+
+
+_PAYLOAD_LOCK = threading.Lock()   # the window's unpack thread and the build worker may both unpack
+
+
+def ensure_payload(progress=None):
+    """Unpack the payload once, and hand back the repository it became. The modes git gave the files
+    (gradlew, the translator binaries) are restored from the zip's own attributes; a stamp (.payload)
+    marks a complete unpack, a leftover .tmp of a killed run is redone from scratch, and the versions
+    before this one go away. progress(fraction) hears how far along it is."""
+    home = payload_home()
+    if payload_ready(): return home
+    pz = payload_zip()
+    if not pz:
+        raise RuntimeError('this build carries no build engine (payload.zip is missing beside the executable):'
+                           ' re-download the app')
+    with _PAYLOAD_LOCK:
+        if payload_ready(): return home   # a concurrent unpack finished first
+        home.parent.mkdir(parents=True, exist_ok=True)
+        tmp = home.parent / f'.{home.name}.tmp{os.getpid()}'
+        shutil.rmtree(tmp, ignore_errors=True)
+        with zipfile.ZipFile(pz) as z:
+            infos = [i for i in z.infolist() if not i.is_dir()]   # the tree grows from its files
+            for n, zi in enumerate(infos):
+                z.extract(zi, tmp)
+                mode = (zi.external_attr >> 16) & 0o7777
+                if mode: os.chmod(tmp / zi.filename, mode)
+                if progress and (n % 25 == 0 or n == len(infos) - 1): progress((n + 1) / len(infos))
+        if home.exists(): shutil.rmtree(home, ignore_errors=True)   # a half-unpacked older attempt
+        tmp.rename(home)
+        (home / '.payload').write_text(VERSION, encoding='utf-8')
+        for old in home.parent.iterdir():   # the engine of a version that is not this one
+            if old != home and old.is_dir() and re.fullmatch(r'[\d.]+', old.name):
+                shutil.rmtree(old, ignore_errors=True)
+        return home
+
+
 def find_repo_around(start):
     """The nxnative repository at or above a folder."""
     start = Path(start).resolve()
@@ -121,16 +185,22 @@ def find_repo_around(start):
 
 def repo_dir(cfg=None):
     """Where the repository is. From source, the checkout this file lives in; a standalone build
-    takes it from the config, NXC_REPO, or the folder it was launched from (the executable is
-    usually dropped into a checkout, whose scripts, translator and Gradle files the build runs)."""
+    carries its own (the payload, unpacked into ~/.nxcompanion/repo/<version>), and --repo or the
+    config's folder still names a checkout instead - a developer pointing the app at their own tree.
+    This decides, it never unpacks: ensure_payload (the build worker, --check, the window's unpack
+    thread) does that, on its own time."""
     if not FROZEN: return REPO
-    for cand in [cfg.get('repo') if cfg else None, os.environ.get('NXC_REPO'),
-                 Path(sys.executable).parent, os.getcwd()]:
+    for cand in [cfg.get('repo') if cfg else None, os.environ.get('NXC_REPO')]:
         if not cand: continue
         if _is_repo_dir(cand): return Path(cand)
         around = find_repo_around(cand)
         if around: return around
-    return REPO   # nothing found: the report's repository row says what is missing
+    if payload_ready(): return payload_home()
+    for cand in [Path(sys.executable).parent, os.getcwd()]:   # a build dropped into a checkout (its own engine is missing)
+        if _is_repo_dir(cand): return Path(cand)
+        around = find_repo_around(cand)
+        if around: return around
+    return payload_home()   # not unpacked yet: the report's engine row says so, the next build unpacks
 
 
 def sdk_status(sdk):
@@ -183,10 +253,26 @@ def tool_report(cfg, which=shutil.which):
     """The whole guided list: what is there, what is missing, and the fix for each miss."""
     rows = []
     repo = repo_dir(cfg)
-    rows.append({'name': 'the repository', 'ok': _is_repo_dir(repo),
-                 'detail': str(repo) if _is_repo_dir(repo) else 'not found - the build runs inside it',
-                 'fix': None if _is_repo_dir(repo) else 'clone or download the repository, then pick its folder (the Repository button, or --repo)',
-                 'fix_cmd': None})
+    if FROZEN:
+        # the engine a standalone build carries: bundled (payload.zip beside the executable) and
+        # unpacked on first use - or, dropped into a checkout, that checkout instead
+        if payload_zip():
+            rows.append({'name': 'the build engine', 'ok': True,
+                         'detail': f'unpacked at {payload_home()}' if payload_ready() else
+                                   f'carried inside this app, unpacks to {payload_home()} on the first build (once)',
+                         'fix': None, 'fix_cmd': None})
+        else:
+            rows.append({'name': 'the build engine', 'ok': _is_repo_dir(repo),
+                         'detail': f'the checkout at {repo}' if _is_repo_dir(repo) else 'missing',
+                         'fix': None if _is_repo_dir(repo) else
+                                'this build is incomplete (no payload.zip beside the executable): re-download the app, '
+                                'or run it inside a checkout',
+                         'fix_cmd': None})
+    else:
+        rows.append({'name': 'the build engine', 'ok': _is_repo_dir(repo),
+                     'detail': f'the checkout at {repo}',
+                     'fix': None if _is_repo_dir(repo) else 'run from a checkout of the repository',
+                     'fix_cmd': None})
     if FROZEN:
         py3 = which('python3')   # the Gradle and shell build steps run system python3; the pipeline's own modules are carried inside
         rows.append({'name': 'python3', 'ok': bool(py3),
@@ -219,10 +305,11 @@ def tool_report(cfg, which=shutil.which):
     scross = repo / 'dm/gfx/tools/spirv_cross_bin/spirv-cross'
     both = xlate.is_file() and scross.is_file()
     runnable = both and (sys.platform == 'darwin' or not run_out([str(xlate), '--source-sha'], timeout=30)[0])
-    rows.append({'name': 'the repository\'s translator and spirv-cross', 'ok': runnable,
-                 'detail': ('in the checkout' if both else 'missing from the checkout') +
+    rows.append({'name': 'the build engine\'s translator and spirv-cross', 'ok': runnable,
+                 'detail': ('in the engine' if both else 'missing from the engine') +
                            ('' if runnable or not both else ' - they are macOS binaries; they cannot run here'),
-                 'fix': None if runnable else ('git checkout / clone the repository again' if not both else
+                 'fix': None if runnable else (('unpack it again (delete ' + str(payload_home()) + ') and let the app redo it'
+                                                if FROZEN and payload_zip() else 'git checkout / clone the repository again') if not both else
                          'they are the Mac binaries the shader chain is locked to: a game\'s shader step needs a Mac today, the steps before it run here'),
                  'fix_cmd': None})
     return rows
@@ -572,6 +659,10 @@ def run_check(argv):
         cfg['sdk'] = str(Path(argv.sdk).resolve()); save_config(cfg)
     if argv.repo:
         cfg['repo'] = str(Path(argv.repo).resolve()); save_config(cfg)
+    if FROZEN and payload_zip() and not payload_ready():
+        print(f'unpacking the build engine (once, into {payload_home()}) ...')
+        ensure_payload(progress=lambda f: print(f'\r  {f:4.0%}', end='', flush=True))
+        print()
     rows = tool_report(cfg)
     print(f'nxnative PC companion {VERSION} - toolchain report ({sys.platform})')
     for r in rows:
@@ -594,71 +685,169 @@ def run_check(argv):
 
 
 # ---- The window ----
-
 def run_gui(argv):
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
     from tkinter.scrolledtext import ScrolledText
+    import tkinter.font as tkfont
 
     cfg = load_config()
+
+    # The house style, sized for a window someone uses twice: a quiet surface, white cards with a
+    # hairline, one accent color, and nothing that is not a step - the pipeline's detail stays one
+    # click down, in the log; the options behind their own small disclosure.
+    SURFACE, CARD, LINE = '#f4f5f7', '#ffffff', '#e3e6ea'
+    INK, DIM, ACCENT, ACCENT_DARK = '#1c2430', '#68717d', '#2456c8', '#1c439b'
+    OK, WARN, ERR = '#1d7a3d', '#b06a00', '#b3261e'
+    MONO = 'Menlo' if sys.platform == 'darwin' else 'Consolas' if os.name == 'nt' else 'monospace'
 
     class App(tk.Tk):
         def __init__(self):
             super().__init__()
-            self.title('nxnative - put a game on the phone')
-            self.geometry('780x600'); self.minsize(640, 480)
+            self.title('nxnative companion')
+            self.geometry('760x680'); self.minsize(620, 540)
+            self.configure(bg=SURFACE)
             self.worker = None; self.proc = None; self.devices = []
-            self.queue = None
+            self.queue = queue.Queue()   # everything the workers and threads want to say, one place
             self.link = None; self.link_serial = None; self.events = queue.Queue()   # the phone's receiver screen
-            f = ttk.Frame(self, padding=10); f.pack(fill='both', expand=True)
+            self.unpacking = False
+            fam = tkfont.nametofont('TkDefaultFont').actual('family')
+            F_TITLE, F_STEP, F_BIG = (fam, 15, 'bold'), (fam, 10, 'bold'), (fam, 11, 'bold')
 
-            ttk.Label(f, text='One game\'s NSPs (base, update, DLC) and the console\'s prod.keys:', ).grid(row=0, column=0, columnspan=3, sticky='w', pady=(0, 4))
+            body = tk.Frame(self, bg=SURFACE); body.pack(fill='both', expand=True)
+            body.grid_columnconfigure(0, weight=1)
+
+            def card(row, title):
+                """A white panel with its heading; the content lands in the rows after it."""
+                c = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=LINE, bd=0)
+                c.grid(row=row, column=0, sticky='ew', padx=18, pady=(0, 10))
+                tk.Label(c, text=title, bg=CARD, fg=INK, anchor='w', font=F_STEP)\
+                    .grid(row=0, column=0, columnspan=3, sticky='w', padx=14, pady=(10, 2))
+                c.grid_columnconfigure(1, weight=1)
+                return c
+
+            def field(c, row, label, value, browse):
+                tk.Label(c, text=label, bg=CARD, fg=DIM, anchor='w', width=9)\
+                    .grid(row=row, column=0, sticky='w', padx=(14, 6), pady=3)
+                e = ttk.Entry(c, textvariable=value); e.grid(row=row, column=1, sticky='ew', pady=3)
+                b = ttk.Button(c, text=browse); b.grid(row=row, column=2, sticky='e', padx=(6, 12), pady=3)
+                return e, b
+
+            # -- the header: the name, and the one status that is not a step --
+            head = tk.Frame(body, bg=SURFACE); head.grid(row=0, column=0, sticky='ew', padx=18, pady=(16, 8))
+            tk.Label(head, text='nxnative', bg=SURFACE, fg=INK, font=F_TITLE).pack(side='left')
+            tk.Label(head, text=f'companion {VERSION}', bg=SURFACE, fg=DIM).pack(side='left', padx=(8, 0), pady=(7, 0))
+            self.b_tools = tk.Label(head, text='\u25cf tools: \u2026', bg=SURFACE, fg=DIM, cursor='hand2')
+            self.b_tools.pack(side='right', pady=(8, 0))
+            self.b_tools.bind('<Button-1>', lambda e: self.open_setup())
+
+            # -- 1: the game's files --
+            c1 = card(1, '1 \u00b7 The game\u2019s files')
             self.v_nsp = tk.StringVar(value=cfg['last_nsp'])
-            ttk.Entry(f, textvariable=self.v_nsp).grid(row=1, column=0, sticky='ew', padx=(0, 4))
-            ttk.Button(f, text='NSP folder\u2026', command=self.pick_nsp).grid(row=1, column=1)
+            _, b1 = field(c1, 1, 'NSP folder', self.v_nsp, 'Browse\u2026'); b1.configure(command=self.pick_nsp)
             self.v_keys = tk.StringVar(value=cfg['last_keys'])
-            ttk.Entry(f, textvariable=self.v_keys).grid(row=2, column=0, sticky='ew', pady=(6, 0), padx=(0, 4))
-            ttk.Button(f, text='prod.keys\u2026', command=self.pick_keys).grid(row=2, column=1)
+            _, b2 = field(c1, 2, 'prod.keys', self.v_keys, 'Browse\u2026'); b2.configure(command=self.pick_keys)
+            tk.Label(c1, text='One game\u2019s NSPs (the base game; update and DLC when you have them) and the console\u2019s prod.keys.',
+                     bg=CARD, fg=DIM, anchor='w', justify='left')\
+                .grid(row=3, column=0, columnspan=3, sticky='w', padx=14, pady=(2, 10))
 
-            opt = ttk.Frame(f); opt.grid(row=3, column=0, columnspan=3, sticky='ew', pady=(10, 0))
-            ttk.Label(opt, text='Language').pack(side='left')
-            self.v_lang = tk.StringVar(value=cfg['language'])
-            self.lang = ttk.Combobox(opt, textvariable=self.v_lang, values=LANGUAGES, width=8); self.lang.pack(side='left', padx=(4, 12))
-            self.v_fps = tk.BooleanVar(value=cfg['show_fps'])
-            ttk.Checkbutton(opt, text='Show frame rate', variable=self.v_fps).pack(side='left', padx=(0, 12))
-            ttk.Label(opt, text='App name').pack(side='left')
-            self.v_name = tk.StringVar(value=cfg['app_name'])
-            ttk.Entry(opt, textvariable=self.v_name, width=18).pack(side='left', padx=4)   # empty: the game's own name
-            f.columnconfigure(0, weight=1)
+            # -- 2: the phone --
+            c2 = card(2, '2 \u00b7 The phone')
+            self.l_phone = tk.Label(c2, text='\u25cf looking for a phone\u2026', bg=CARD, fg=DIM, anchor='w')
+            self.l_phone.grid(row=1, column=0, sticky='w', padx=14, pady=(6, 0))
+            self.b_recv = ttk.Button(c2, text='Install the receiver app\u2026', command=self.install_receiver)
+            self.b_recv.grid(row=1, column=1, sticky='e', padx=(6, 0))   # only while a phone is there with no nxnative app on it
+            self.b_recv.grid_remove()
+            self.l_link = tk.Label(c2, text='receiver: -', bg=CARD, fg=DIM, anchor='e')
+            self.l_link.grid(row=1, column=2, sticky='e', padx=12)
+            tk.Label(c2, text='Plug it in over USB, with USB debugging on - its screen follows the build, and the game lands on it.',
+                     bg=CARD, fg=DIM, anchor='w', justify='left')\
+                .grid(row=2, column=0, columnspan=3, sticky='w', padx=14, pady=(2, 10))
 
-            state = ttk.Frame(f); state.grid(row=4, column=0, columnspan=3, sticky='ew', pady=(12, 0))
-            self.b_phone = tk.Label(state, text='\u25cf ?', fg='#888'); self.b_phone.pack(side='left')
-            self.b_link = tk.Label(state, text='\u25cf receiver: -', fg='#888'); self.b_link.pack(side='left', padx=(10, 0))
-            self.b_tools = tk.Label(state, text='\u25cf ?', fg='#888'); self.b_tools.pack(side='left')
-            self.b_setup = ttk.Button(state, text='Toolchain\u2026', command=self.open_setup); self.b_setup.pack(side='left', padx=(8, 0))
-            self.b_sdk = ttk.Button(state, text='SDK path\u2026', command=self.pick_sdk); self.b_sdk.pack(side='left', padx=(4, 0))
-            self.b_repo = ttk.Button(state, text='Repository\u2026', command=self.pick_repo); self.b_repo.pack(side='left', padx=(4, 0))   # a standalone build's checkout
-            # packed only while a phone is plugged in with no nxnative app on it (see drain_events)
-            self.b_recv = ttk.Button(state, text='Install receiver app\u2026', command=self.install_receiver)
-
-            self.b_build = ttk.Button(f, text='Build & install', command=self.start)
-            self.b_build.grid(row=5, column=0, columnspan=3, sticky='ew', pady=(14, 6))
+            # -- the action: one button, one bar, one line of where it is --
+            act = tk.Frame(body, bg=SURFACE); act.grid(row=3, column=0, sticky='ew', padx=18, pady=(4, 10))
+            act.grid_columnconfigure(0, weight=1)
+            self.b_build = tk.Button(act, text='Build & install', command=self.start, bg=ACCENT, fg='#ffffff',
+                                    activebackground=ACCENT_DARK, activeforeground='#ffffff', disabledforeground='#a8bce8',
+                                    relief='flat', bd=0, padx=24, pady=10, font=F_BIG, cursor='hand2')
+            self.b_build.grid(row=0, column=0, sticky='ew')
+            st = ttk.Style(self)
+            st.configure('nx.Horizontal.TProgressbar', troughcolor=LINE, background=ACCENT,
+                         lightcolor=ACCENT, darkcolor=ACCENT, bordercolor=SURFACE, thickness=8)
+            self.bar = ttk.Progressbar(act, style='nx.Horizontal.TProgressbar', maximum=1.0, value=0.0)
+            self.bar.grid(row=1, column=0, sticky='ew', pady=(10, 2))
             self.v_stage = tk.StringVar(value='idle')
-            ttk.Label(f, textvariable=self.v_stage, anchor='w').grid(row=6, column=0, columnspan=3, sticky='ew')
-            self.log = ScrolledText(f, height=14, state='disabled', wrap='none', bg='#111', fg='#ddd', font=('Menlo' if sys.platform == 'darwin' else 'Consolas' if os.name == 'nt' else 'monospace', 10))
-            self.log.grid(row=7, column=0, columnspan=3, sticky='nsew')
-            for tag, color in (('ok', '#6f6'), ('err', '#f66'), ('dim', '#999')): self.log.tag_configure(tag, foreground=color)
-            f.rowconfigure(7, weight=1); f.columnconfigure(0, weight=1)
+            tk.Label(act, textvariable=self.v_stage, bg=SURFACE, fg=DIM, anchor='w')\
+                .grid(row=2, column=0, sticky='ew')
+
+            # -- the options, away until asked for --
+            self.v_more = tk.BooleanVar(value=False)
+            self.b_more = tk.Label(act, text='\u25b8 Options', bg=SURFACE, fg=ACCENT, cursor='hand2')
+            self.b_more.grid(row=3, column=0, sticky='w', pady=(6, 0))
+            self.b_more.bind('<Button-1>', lambda e: self.toggle_options())
+            self.opt = tk.Frame(act, bg=SURFACE)
+            self.v_lang = tk.StringVar(value=cfg['language'])
+            tk.Label(self.opt, text='Language', bg=SURFACE, fg=DIM).grid(row=0, column=0, sticky='w')
+            ttk.Combobox(self.opt, textvariable=self.v_lang, values=LANGUAGES, width=9).grid(row=0, column=1, sticky='w', padx=(4, 16))
+            self.v_fps = tk.BooleanVar(value=cfg['show_fps'])
+            ttk.Checkbutton(self.opt, text='Show frame rate', variable=self.v_fps).grid(row=0, column=2, sticky='w', padx=(0, 16))
+            tk.Label(self.opt, text='App name', bg=SURFACE, fg=DIM).grid(row=0, column=3, sticky='w')
+            self.v_name = tk.StringVar(value=cfg['app_name'])
+            ttk.Entry(self.opt, textvariable=self.v_name, width=18).grid(row=0, column=4, sticky='w', padx=4)   # empty: the game's own name
+
+            # -- the log: what the build actually said, one click down --
+            logc = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=LINE, bd=0)
+            logc.grid(row=4, column=0, sticky='nsew', padx=18, pady=(0, 16))
+            body.rowconfigure(4, weight=1)
+            tk.Label(logc, text='Details', bg=CARD, fg=DIM, anchor='w', font=F_STEP).grid(row=0, column=0, sticky='w', padx=14, pady=(10, 2))
+            self.log = ScrolledText(logc, height=8, state='disabled', wrap='none', bg='#171a20', fg='#d6dae2',
+                                    font=(MONO, 10), bd=0, highlightthickness=0, insertbackground='#d6dae2')
+            self.log.grid(row=1, column=0, sticky='nsew', padx=10, pady=(0, 10))
+            logc.grid_columnconfigure(0, weight=1); logc.rowconfigure(1, weight=1)
+            for tag, color in (('ok', '#6f6'), ('err', '#f66'), ('dim', '#8a919c')): self.log.tag_configure(tag, foreground=color)
 
             self.protocol('WM_DELETE_WINDOW', self.close)
-            self.after(50, self.refresh_tools); self.after(2000, self.poll_phone)
+            self.after(50, self.refresh_tools); self.after(100, self.drain); self.after(2000, self.poll_phone)
+            if FROZEN and payload_zip() and not payload_ready(): self.begin_unpack()
+
+        def begin_unpack(self):
+            """The engine's one-time unpack, out of the window's way: the bar runs, the button waits."""
+            self.unpacking = True
+            self.b_build['state'] = 'disabled'
+            self.v_stage.set('unpacking the build engine (once, about a minute) \u2026')
+            self.bar.config(mode='indeterminate'); self.bar.start(14)
+
+            def unpack():
+                try:
+                    ensure_payload(progress=lambda f: self.queue.put(('bar', f)))
+                    self.queue.put(('payload', 'the build engine is ready'))
+                except Exception as e:   # the app cannot build: the reason goes where the user reads
+                    self.queue.put(('fail', str(e)))
+            threading.Thread(target=unpack, daemon=True, name='unpack').start()
+
+        def toggle_options(self):
+            self.v_more.set(not self.v_more.get())
+            if self.v_more.get():
+                self.opt.grid(row=4, column=0, sticky='w', pady=(4, 0)); self.b_more['text'] = '\u25be Options'
+            else:
+                self.opt.grid_remove(); self.b_more['text'] = '\u25b8 Options'
 
         # -- helpers --
         def say(self, msg, tag=None):
             self.log['state'] = 'normal'; self.log.insert('end', msg + '\n', tag or ()); self.log.see('end'); self.log['state'] = 'disabled'
 
+        def bar_set(self, frac):
+            """The pipeline's own word on where it is: a fraction drives the bar, None pulses it."""
+            if frac is None:
+                if str(self.bar.cget('mode')) != 'indeterminate':
+                    self.bar.config(mode='indeterminate'); self.bar.start(14)
+            else:
+                if str(self.bar.cget('mode')) != 'determinate':
+                    self.bar.stop(); self.bar.config(mode='determinate')
+                self.bar.config(value=max(0.0, min(1.0, float(frac))))
+
         def pick_nsp(self):
-            d = filedialog.askdirectory(title='The folder holding one game\'s NSPs', parent=self)
+            d = filedialog.askdirectory(title='The folder holding one game\u2019s NSPs', parent=self)
             if d: self.v_nsp.set(d)
         def pick_keys(self):
             p = filedialog.askopenfilename(title='prod.keys', parent=self)
@@ -667,58 +856,68 @@ def run_gui(argv):
             d = filedialog.askdirectory(title='The Android SDK folder (adb, ndk, build-tools inside)', parent=self)
             if d:
                 cfg.update(sdk=d); save_config(cfg); self.refresh_tools()
-        def pick_repo(self):
-            d = filedialog.askdirectory(title='The nxnative repository folder (scripts and dm inside)', parent=self)
-            if d:
-                cfg.update(repo=d); save_config(cfg); self.refresh_tools()
 
         def refresh_tools(self):
             rows = tool_report(cfg)
             miss = [r for r in rows if not r['ok']]
             self.b_tools['text'] = f"\u25cf tools: {'ready' if not miss else str(len(miss)) + ' missing'}"
-            self.b_tools['fg'] = '#2a2' if not miss else '#d33'
-            self.b_build['text'] = 'Build & install' if not miss else 'Build & install (toolchain incomplete)'
+            self.b_tools['fg'] = OK if not miss else WARN
+            if not self.unpacking:
+                self.b_build['text'] = 'Build & install' if not miss else 'Build & install (toolchain incomplete)'
             self.setup_rows = rows
 
         def poll_phone(self):
             dev = list_devices(cfg)
             if dev is None:
-                self.b_phone['text'] = '\u25cf no adb'; self.b_phone['fg'] = '#d33'; self.devices = []
+                self.l_phone['text'] = '\u25cf no adb - the Toolchain page fixes that'; self.l_phone['fg'] = ERR; self.devices = []
                 self.stop_link()
             else:
                 self.devices = [d for d in dev if d[1] == 'device']
                 if self.devices:
                     serial, model = self.devices[0][0], self.devices[0][2]
-                    self.b_phone['text'] = f'\u25cf {model} ({serial})'; self.b_phone['fg'] = '#2a2'
+                    self.l_phone['text'] = f'\u25cf {model} \u00b7 connected'; self.l_phone['fg'] = OK
                     if serial != self.link_serial:   # plugged in, or a different phone: raise the receiver on it
                         self.stop_link(); self.link_serial = serial
                         threading.Thread(target=self.raise_receiver, args=(serial,), daemon=True).start()
                 else:
                     plugged = [d for d in dev if d[1] != 'device']
-                    self.b_phone['text'] = ('\u25cf plugged in - accept the USB debugging prompt on the phone' if plugged
-                                            else '\u25cf no phone - plug in over USB, enable USB debugging')
-                    self.b_phone['fg'] = '#c80' if plugged else '#d33'
+                    self.l_phone['text'] = ('\u25cf plugged in - accept the USB debugging prompt on the phone' if plugged
+                                            else '\u25cf no phone yet - plug one in over USB')
+                    self.l_phone['fg'] = WARN if plugged else DIM
                     self.stop_link()   # ...and back to "waiting" goes the receiver screen (unplug = replug = raised again)
-            self.drain_events()
             self.after(2000, self.poll_phone)
 
-        def drain_events(self):
-            """The receiver threads (adb calls and the link) never touch the window: they put events
-            here, this tick applies them."""
+        def drain(self):
+            """One place, every tick: what the workers and the phone threads want the window to show."""
             try:
                 while True:
-                    kind, val = self.events.get_nowait()
-                    if kind == 'link':
+                    kind, *rest = self.queue.get_nowait()
+                    if kind == 'stage':
+                        self.v_stage.set(rest[0]); self.bar_set(None)
+                    elif kind == 'log': self.say(rest[0], *rest[1:])
+                    elif kind == 'bar': self.bar_set(rest[0])
+                    elif kind == 'payload':
+                        self.unpacking = False; self.bar_set(1.0)
+                        self.v_stage.set(rest[0]); self.say(rest[0], 'dim'); self.refresh_tools()
+                        self.b_build['state'] = 'normal'
+                    elif kind == 'done':
+                        self.v_stage.set('done'); self.bar_set(1.0); self.say(rest[0], 'ok')
+                        self.b_build['state'] = 'normal'; self.b_build['text'] = 'Build & install'
+                    elif kind == 'fail':
+                        self.v_stage.set('failed'); self.bar_set(0.0); self.say(rest[0], 'err')
+                        self.b_build['state'] = 'normal'
+                        self.unpacking = False   # a failed unpack keeps the engine missing: the next build says so again
+                    elif kind == 'link':
                         if self.link: self.link.stop()   # one link at a time
-                        self.link = val; self.link.start()
+                        self.link = rest[0]; self.link.start()
                     elif kind == 'pkg':
-                        if val: self.say(f'receiver app on the phone: {val}', 'dim')
-                        else: self.b_recv.pack(side='left', padx=(6, 0))   # nothing to raise: offer the template
-                    elif kind == 'log': self.say(val, 'dim')
+                        if rest[0]: self.say(f'receiver app on the phone: {rest[0]}', 'dim')
+                        else: self.b_recv.grid()   # nothing to raise: offer the template
                     elif kind == 'live':
-                        self.b_link['text'] = '\u25cf receiver: live' if val else '\u25cf receiver: off'
-                        self.b_link['fg'] = '#2a2' if val else '#888'
+                        self.l_link['text'] = 'receiver: live' if rest[0] else 'receiver: off'
+                        self.l_link['fg'] = OK if rest[0] else DIM
             except queue.Empty: pass
+            self.after(100, self.drain)
 
         def raise_receiver(self, serial):
             """A worker (adb takes a moment): find the app to raise, am start it, hand the link back
@@ -736,8 +935,8 @@ def run_gui(argv):
         def stop_link(self):
             if self.link: self.link.stop(); self.link = None
             self.link_serial = None
-            self.b_link['text'] = '\u25cf receiver: -'; self.b_link['fg'] = '#888'
-            self.b_recv.pack_forget()
+            self.l_link['text'] = 'receiver: -'; self.l_link['fg'] = DIM
+            self.b_recv.grid_remove()
 
         def phone(self, obj):
             """The build's word to the phone's screen; queued, never blocking, dropped when nobody
@@ -747,21 +946,23 @@ def run_gui(argv):
 
         def install_receiver(self):
             if self.worker and self.worker.is_alive(): return
+            if self.unpacking:
+                messagebox.showinfo('The build engine', 'It is still unpacking - a moment.', parent=self); return
             rows = tool_report(cfg); miss = [r['name'] for r in rows if not r['ok']]
             if miss and not messagebox.askyesno('Toolchain', 'These are missing: ' + ', '.join(miss) + '\n\nStart anyway?', parent=self): return
-            self.b_recv.pack_forget(); self.b_build['state'] = 'disabled'
-            self.queue = self.queue or queue.Queue()
+            self.b_recv.grid_remove(); self.b_build['state'] = 'disabled'
             self.worker = threading.Thread(target=self.receiver_install, daemon=True)
-            self.worker.start(); self.after(100, self.drain)
+            self.worker.start()
 
         def receiver_install(self):
             """The template build for a phone with no nxnative app on it: the same Gradle the games
             go through (no game staged, the shell's applicationId), then the same align-sign-install."""
             q = self.queue
-            android = repo_dir(cfg) / 'dm' / 'android'
-            gradlew = android / ('gradlew.bat' if os.name == 'nt' else 'gradlew')
             try:
-                if not gradlew.exists(): raise RuntimeError('no gradlew in the checkout: ' + str(android))
+                if FROZEN: ensure_payload(progress=lambda f: q.put(('bar', f)))   # the engine, unpacked before it is needed
+                android = repo_dir(cfg) / 'dm' / 'android'
+                gradlew = android / ('gradlew.bat' if os.name == 'nt' else 'gradlew')
+                if not gradlew.exists(): raise RuntimeError('no gradlew in the engine: ' + str(android))
                 env = dict(os.environ)
                 if cfg.get('sdk'): env['ANDROID_HOME'] = cfg['sdk']
                 env['GAME'] = PROFILE   # the host compiles against a committed profile (the template carries no game files; the same GAME the CI workflow sets)
@@ -798,7 +999,7 @@ def run_gui(argv):
         # -- the setup window: the guided list, each miss with its fix and an Install button where one click can do it --
         def open_setup(self):
             win = tk.Toplevel(self); win.title('Toolchain'); win.transient(self)
-            win.geometry('720x420')
+            win.geometry('720x440')
             body = ttk.Frame(win, padding=10); body.pack(fill='both', expand=True)
             text = ScrolledText(body, height=16, wrap='word'); text.pack(fill='both', expand=True)
             text.tag_configure('ok', foreground='#282'); text.tag_configure('miss', foreground='#c22')
@@ -815,29 +1016,32 @@ def run_gui(argv):
                 sel = [r for r in rows if not r['ok'] and r['fix_cmd']]
                 if not sel: return
                 rc, out = run_out(sel[0]['fix_cmd'])
-                text['state'] = 'normal'; text.insert('end', f'\n$ {" ".join(sel[0]["fix_cmd"])}\n{out.strip()[-1500:]}\n', 'dim'); text['state'] = 'disabled'
+                text['state'] = 'normal'; text.insert('end', f'\n$ {" ".join(sel[0]["fix_cmd"])}\n{out.strip()[-1500:]}\n', 'miss'); text['state'] = 'disabled'
                 rows = tool_report(cfg); render(rows); self.refresh_tools()
             ttk.Button(bar, text='Install the first missing piece', command=run_fix).pack(side='left')
             ttk.Button(bar, text='Check again', command=lambda: (setattr(self, 'setup_rows', tool_report(cfg)), render(self.setup_rows), self.refresh_tools())).pack(side='left', padx=6)
+            ttk.Button(bar, text='SDK path\u2026', command=self.pick_sdk).pack(side='left')
             ttk.Label(bar, text='Windows: the window runs by itself; the build steps want bash, make and python3 (MSYS2\nprovides them, or the whole build inside WSL2), and adb needs the phone attached with usbipd-win', justify='left').pack(side='right')
 
         # -- the build --
         def start(self):
             if self.worker and self.worker.is_alive(): return
+            if self.unpacking:
+                messagebox.showinfo('The build engine', 'It is still unpacking - a moment.', parent=self); return
             nsp, keys = self.v_nsp.get().strip(), self.v_keys.get().strip()
             if not nsp or not Path(nsp).is_dir():
-                messagebox.showerror('NSP folder', 'Pick the folder that holds one game\'s NSPs (the base game; update and DLC if you have them)', parent=self); return
+                messagebox.showerror('NSP folder', 'Pick the folder that holds one game\u2019s NSPs (the base game; update and DLC if you have them)', parent=self); return
             if not keys or not Path(keys).is_file():
-                messagebox.showerror('prod.keys', 'Pick the console\'s prod.keys file', parent=self); return
+                messagebox.showerror('prod.keys', 'Pick the console\u2019s prod.keys file', parent=self); return
             rows = tool_report(cfg); miss = [r['name'] for r in rows if not r['ok']]
             if miss and not messagebox.askyesno('Toolchain', 'These are missing: ' + ', '.join(miss) + '\n\nStart anyway (it will stop at the first one)?', parent=self): return
             cfg.update(last_nsp=nsp, last_keys=keys, language=self.v_lang.get().strip() or 'en-US',
                        show_fps=bool(self.v_fps.get()), app_name=self.v_name.get().strip()); save_config(cfg)
             self.log['state'] = 'normal'; self.log.delete('1.0', 'end'); self.log['state'] = 'disabled'
+            self.bar_set(0.0)
             self.b_build['state'] = 'disabled'
-            self.queue = queue.Queue()
             self.worker = threading.Thread(target=self.build, args=(nsp, keys, cfg['language'], cfg['show_fps'], cfg['app_name']), daemon=True)
-            self.worker.start(); self.after(100, self.drain)
+            self.worker.start()
 
         def build(self, nsp, keys, lang, fps, app_name):
             """The worker thread: the pipeline, then align-sign-install. Everything reaches the window through the queue."""
@@ -848,6 +1052,10 @@ def run_gui(argv):
                 prog_file = Path(tempfile.gettempdir()) / f'nxcompanion-{os.getpid()}-{int(time.time())}.jsonl'
                 env['PROGRESS_FILE'] = str(prog_file)
             if cfg.get('sdk'): env['ANDROID_HOME'] = cfg['sdk']
+            if FROZEN and not payload_ready():
+                q.put(('stage', 'unpacking the build engine (once) \u2026'))
+                ensure_payload(progress=lambda f: q.put(('bar', f)))
+                q.put(('log', 'the build engine is ready', 'dim'))
             repo = repo_dir(cfg)
             cmd = pipeline_command(nsp, keys, lang, fps, app_name, repo=repo)
             q.put(('stage', f'building: {" ".join(cmd[1:])}'))
@@ -870,6 +1078,7 @@ def run_gui(argv):
                         self.phone(phone_status(ev))
                     elif ev and ev.get('ev') == 'progress':
                         self.phone(phone_status(ev))   # the shader counts: the phone's bar lives on these
+                        q.put(('bar', ev.get('frac')))   # ...and the window's bar does too
                         q.put(('log', line.rstrip()))
                     elif ev and ev.get('ev') == 'say':
                         q.put(('log', str(ev.get('msg', ''))))
@@ -908,34 +1117,10 @@ def run_gui(argv):
                     rc, out = run_out(adb_install_command(adb, serial, apk), timeout=600)
                     if rc: raise RuntimeError('adb install failed: ' + out.strip()[-300:] + ' (USB debugging: the phone must show the trust prompt)')
                     self.phone({'event': 'status', 'state': 'done', 'game': game})   # the shell app survives a game's install; a same-app update closes its own link
-                    q.put(('done', f'installed on {self.devices[0][2]} - the game\'s icon is on the home screen'))
+                    q.put(('done', f'installed on {self.devices[0][2]} - the game\u2019s icon is on the home screen'))
             except Exception as e:   # the worker never takes the window down: the reason goes to the log
                 q.put(('fail', str(e)))
                 self.phone({'event': 'status', 'state': 'error', 'message': str(e).strip()[-300:]})
-        def drain(self):
-            try:
-                while True:
-                    kind, *rest = self.queue.get_nowait()
-                    if kind == 'stage': self.v_stage.set(rest[0])
-                    elif kind == 'log': self.say(rest[0], *rest[1:])
-                    elif kind == 'done':
-                        self.v_stage.set('done'); self.say(rest[0], 'ok'); self.b_build['state'] = 'normal'
-                        self.b_build['text'] = 'Build & install'
-                    elif kind == 'fail':
-                        self.v_stage.set('failed'); self.say(rest[0], 'err'); self.b_build['state'] = 'normal'
-            except queue.Empty: pass
-            if self.worker and self.worker.is_alive(): self.after(100, self.drain)
-            else: self.drain_final()
-
-        def drain_final(self):
-            try:
-                while True:
-                    kind, *rest = self.queue.get_nowait()
-                    if kind == 'stage': self.v_stage.set(rest[0])
-                    elif kind == 'log': self.say(rest[0], *rest[1:])
-                    elif kind == 'done': self.v_stage.set('done'); self.say(rest[0], 'ok'); self.b_build['state'] = 'normal'; self.b_build['text'] = 'Build & install'
-                    elif kind == 'fail': self.v_stage.set('failed'); self.say(rest[0], 'err'); self.b_build['state'] = 'normal'
-            except queue.Empty: pass
 
         def close(self):
             if self.worker and self.worker.is_alive() and not messagebox.askyesno('A build is running', 'Stop it and quit?', parent=self): return
@@ -945,7 +1130,6 @@ def run_gui(argv):
             self.destroy()
 
     App().mainloop()
-
 
 def main(argv):
     _trace('main entered')
@@ -1012,7 +1196,7 @@ def main(argv):
     ap = argparse.ArgumentParser(prog='pc_companion', description='pick the NSPs and prod.keys, get an installed game on the phone (dm/android/tools/pc_companion.py)')
     ap.add_argument('--check', action='store_true', help='print the toolchain and device report and exit (no window)')
     ap.add_argument('--sdk', help='remember the Android SDK path (the Toolchain button in the window does the same)')
-    ap.add_argument('--repo', help='remember the repository folder (a standalone build needs it: the Repository button does the same)')
+    ap.add_argument('--repo', help='use this checkout instead of the build engine the app carries (development)')
     args = ap.parse_args(argv)
     if args.check: return run_check(args)
     run_gui(args)

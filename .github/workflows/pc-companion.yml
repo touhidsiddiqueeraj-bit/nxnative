@@ -1,14 +1,16 @@
-# nxnative's PC companion as standalone executables: the window and the whole build pipeline
-# (run_as_python) in one file per platform - Linux, Windows and a universal2 macOS build - so a
-# user needs no Python of their own for the window. dm/android/tools/freeze.py packs it; the
-# repository itself, bash, make, python3, dotnet, Java and the Android SDK stay outside (the
-# companion's Toolchain window guides them in).
+# nxnative's PC companion as one standalone app per platform: the window, the whole build pipeline
+# (run_as_python) and the build engine itself (payload.zip beside the executable: every file git
+# tracks, unpacked once into ~/.nxcompanion/repo/<version> on the user's machine) - so a user needs
+# no Python of their own for the window and no checkout of the repository for the build. Windows,
+# Linux and a universal2 macOS build; dm/android/tools/freeze.py packs it. bash, make, python3,
+# dotnet, Java and the Android SDK stay outside (the companion's Toolchain window guides them in).
 #
-# CI (pushes and pull requests touching the involved files): the three builds plus two smoke tests
-# each - the --check report runs, and a script handed to the executable imports every third-party
-# module the pipeline uses (lz4, capstone, fontTools, nsz, the zstd binding) and exercises a
-# ProcessPoolExecutor, the shader split's own worker mechanism (a spawn child re-runs a windowed
-# executable; freeze_support answers it).
+# CI (pushes and pull requests touching the involved files): the three builds plus three smoke
+# tests each - the --check report runs (and unpacks the payload it carries), a script handed to
+# the executable imports every third-party module the pipeline uses (lz4, capstone, fontTools,
+# nsz, the zstd binding) and exercises a ProcessPoolExecutor, the shader split's own worker
+# mechanism (a spawn child re-runs a windowed executable; freeze_support answers it), and the
+# payload's own pipeline script runs inside the executable as python3 would run it.
 #
 # CD (a tag v*): the same builds, packaged (zip on Windows, tar.gz elsewhere) and attached to the
 # GitHub release, named after the version pc_companion.py carries.
@@ -50,21 +52,38 @@ jobs:
           python-version: '3.12'   # the version the pipeline's zstd backport targets (3.14+ carries zstd itself)
       - name: The freeze toolchain
         run: python3 -m pip install pyinstaller lz4 capstone fonttools backports.zstd nsz
-      - name: "Freeze (one executable: the window and the pipeline)"
+      - name: "Freeze (the app: the window, the pipeline and the engine it runs on)"
         run: python3 dm/android/tools/freeze.py staging
-      - name: "Smoke: the --check report runs"
+      - name: "Smoke: the --check report runs (and the payload it carries unpacks)"
         shell: bash
         run: |
           set -eu
           case "${{ runner.os }}" in
             macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
             Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;   # a folder build: no extraction per process
-            *) EXE=staging/nxcompanion ;;
+            *) EXE=staging/nxcompanion/nxcompanion ;;   # a folder build on Linux too
           esac
-          "$EXE" --check && rc=0 || rc=$?
+          "$EXE" --check > check-out.txt 2>&1 && rc=0 || rc=$?
           # exit 1 is the report's own 'not ready' on a bare runner; anything else is a crash
-          [ "$rc" -le 1 ] || exit "$rc"
+          [ "$rc" -le 1 ] || { cat check-out.txt; exit "$rc"; }
           echo "--check exited $rc (0 ready, 1 not ready on a bare runner)"
+          grep -F 'the build engine' check-out.txt   # the engine row: carried and unpacked, never 'missing'
+      - name: "Smoke: the payload's own pipeline script runs inside it"
+        shell: bash
+        run: |
+          set -eu
+          case "${{ runner.os }}" in
+            macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
+            Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;
+            *) EXE=staging/nxcompanion/nxcompanion ;;
+          esac
+          # the engine --check unpacked into ~/.nxcompanion/repo/<version>: its script must run in
+          # the executable as python3 would run it (run_as_python), or every build on a user's
+          # machine dies before the first stage
+          PAYLOAD_SCRIPT=$(find "$HOME/.nxcompanion/repo" -maxdepth 3 -name build_apk_from_nsp.py | head -1)
+          test -n "$PAYLOAD_SCRIPT"
+          "$EXE" "$PAYLOAD_SCRIPT" --help | grep -F 'NSP'
+          echo "the payload's script ran: $PAYLOAD_SCRIPT"
       - name: "Smoke: the pipeline's modules and workers run inside it"
         shell: bash
         timeout-minutes: 15
@@ -73,7 +92,7 @@ jobs:
           case "${{ runner.os }}" in
             macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
             Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;
-            *) EXE=staging/nxcompanion ;;
+            *) EXE=staging/nxcompanion/nxcompanion ;;
           esac
           cat > smoke_modules.py <<'EOF'
           # every third-party module the pipeline imports at run time, imported inside the executable

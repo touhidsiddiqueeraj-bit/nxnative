@@ -142,11 +142,11 @@ class Toolchain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': str(Path(tmp) / 'sdk')}):
             with unittest.mock.patch.object(self.pc.shutil, 'which', return_value=None), \
                  unittest.mock.patch.object(self.pc, '_importable', return_value=False), \
-                 unittest.mock.patch.object(self.pc, 'REPO', Path(tmp)):   # a machine with no checkout: the repository row fails too
+                 unittest.mock.patch.object(self.pc, 'REPO', Path(tmp)):   # a machine with no checkout: the engine row fails too
                 rows = self.pc.tool_report({}, which=lambda name: None)
                 by_name = {r['name']: r for r in rows}
                 self.assertFalse(any(r['ok'] for r in rows))
-                self.assertIn('clone or download the repository', by_name['the repository']['fix'])   # guided, not just failed
+                self.assertIn('run from a checkout', by_name['the build engine']['fix'])   # guided, not just failed
                 self.assertIn('developer.android.com', by_name['Android SDK']['fix'])
                 self.assertIn('build-essential', by_name['make']['fix'])
 
@@ -398,13 +398,33 @@ class FrozenMode(unittest.TestCase):
             (checkout / 'dm' / 'android').mkdir(parents=True)
             nested = checkout / 'somewhere' / 'deep'; nested.mkdir(parents=True)
             with unittest.mock.patch.object(self.pc, 'FROZEN', True), \
-                 unittest.mock.patch.object(self.pc, 'REPO', Path('/nowhere')):
+                 unittest.mock.patch.object(self.pc, 'REPO', Path('/nowhere')), \
+                 unittest.mock.patch.object(self.pc, 'payload_home', lambda: Path(tmp) / 'no-payload-yet'), \
+                 unittest.mock.patch.object(self.pc, 'payload_ready', lambda: False):   # no unpacked engine: the walk is the fallback
                 old = os.getcwd(); os.chdir(nested)
                 try:
                     self.assertEqual(self.pc.repo_dir(), checkout)   # the launch folder, then its parents
                     self.assertEqual(self.pc.repo_dir({'repo': ''}), checkout)   # nothing remembered: same walk
                 finally: os.chdir(old)
-                self.assertEqual(self.pc.repo_dir({'repo': str(checkout)}), checkout)   # the Repository button's choice
+                self.assertEqual(self.pc.repo_dir({'repo': str(checkout)}), checkout)   # --repo's choice
+
+    def test_a_frozen_app_prefers_its_own_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'repo' / self.pc.VERSION; home.mkdir(parents=True)
+            (home / 'scripts').mkdir(); (home / 'scripts' / 'build_apk_from_nsp.py').write_text('')
+            (home / 'dm' / 'android').mkdir(parents=True)
+            checkout = Path(tmp) / 'a-checkout-around'
+            (checkout / 'scripts').mkdir(parents=True); (checkout / 'scripts' / 'build_apk_from_nsp.py').write_text('')
+            (checkout / 'dm' / 'android').mkdir(parents=True)
+            with unittest.mock.patch.object(self.pc, 'FROZEN', True), \
+                 unittest.mock.patch.object(self.pc, 'payload_home', lambda: home), \
+                 unittest.mock.patch.object(self.pc, 'payload_ready', lambda: True), \
+                 unittest.mock.patch.object(self.pc, 'REPO', Path('/nowhere')):
+                old = os.getcwd(); os.chdir(checkout)
+                try:
+                    self.assertEqual(self.pc.repo_dir(), home)   # the bundled engine, not whatever folder it sits in
+                finally: os.chdir(old)
+                self.assertEqual(self.pc.repo_dir({'repo': str(checkout)}), checkout)   # --repo still overrides it
 
     def test_the_exe_runs_helpers_as_python3_would(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -469,6 +489,101 @@ class FrozenMode(unittest.TestCase):
         self.assertEqual(called, [1])   # the spawn child was served before the window or argparse ever ran
 
 
+class PayloadMode(unittest.TestCase):
+    """The engine a standalone build carries beside its executable: where payload.zip is found, how
+    it unpacks (once, modes and all), and what the machine is told when it is not there."""
+
+    def setUp(self): self.pc = load_pc()
+
+    def fake_payload(self, tmp):
+        """A little payload.zip the way freeze.py makes one: the tree, the modes in the attributes."""
+        import zipfile
+        pz = Path(tmp) / 'payload.zip'
+        with zipfile.ZipFile(pz, 'w', zipfile.ZIP_DEFLATED) as z:
+            for mode, path, body in ((0o755, 'dm/android/gradlew', '#!/bin/sh\n'),
+                                     (0o644, 'scripts/build_apk_from_nsp.py', 'print("the pipeline")\n'),
+                                     (0o644, 'dm/android/app/src/main/AndroidManifest.xml', '<manifest/>\n')):
+                zi = zipfile.ZipInfo(path, date_time=(1980, 1, 1, 0, 0, 0))
+                zi.external_attr = mode << 16
+                zi.compress_type = zipfile.ZIP_DEFLATED
+                z.writestr(zi, body)
+        return pz
+
+    def frozen(self, **kw):
+        patches = [unittest.mock.patch.object(self.pc, 'FROZEN', True)]
+        for k, v in kw.items(): patches.append(unittest.mock.patch.object(self.pc, k, v))
+        enter = [p.__enter__() for p in patches]
+        self.addCleanup(lambda: [p.__exit__(None, None, None) for p in reversed(patches)])
+
+    def test_payload_zip_is_found_beside_the_executable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = Path(tmp) / 'nxcompanion' / 'nxcompanion.exe'
+            exe.parent.mkdir(parents=True); exe.write_bytes(b'')
+            for where in ('_internal', '.'):
+                (exe.parent / where).mkdir(exist_ok=True); (exe.parent / where / 'payload.zip').write_bytes(b'zip')
+            mac = Path(tmp) / 'nxcompanion.app' / 'Contents' / 'MacOS' / 'nxcompanion'
+            mac.parent.mkdir(parents=True); mac.write_bytes(b'')
+            (mac.parent.parent / 'Resources').mkdir(); (mac.parent.parent / 'Resources' / 'payload.zip').write_bytes(b'zip')
+            self.frozen()
+            with unittest.mock.patch.object(sys, 'executable', str(exe)):
+                self.assertEqual(self.pc.payload_zip(), exe.parent / '_internal' / 'payload.zip')   # the folder build's own place first
+            (exe.parent / '_internal' / 'payload.zip').unlink()
+            with unittest.mock.patch.object(sys, 'executable', str(exe)):
+                self.assertEqual(self.pc.payload_zip(), exe.parent / 'payload.zip')
+                (exe.parent / 'payload.zip').unlink()
+                self.assertIsNone(self.pc.payload_zip())   # nothing else beside it
+            with unittest.mock.patch.object(sys, 'executable', str(mac)):
+                self.assertEqual(self.pc.payload_zip(), mac.parent.parent / 'Resources' / 'payload.zip')   # the Mac app
+
+    def test_the_payload_unpacks_once_with_its_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pz = self.fake_payload(tmp)
+            home = Path(tmp) / 'repo' / self.pc.VERSION
+            old = home.parent / '1.0.0'; old.mkdir(parents=True); (old / 'leftover').write_text('')
+            self.frozen(payload_home=lambda: home, payload_ready=lambda: (home / '.payload').is_file(),
+                        payload_zip=lambda: pz)
+            seen = []
+            got = self.pc.ensure_payload(progress=seen.append)
+            self.assertEqual(got, home)
+            self.assertTrue(seen and seen[-1] == 1.0)   # the progress ran all the way
+            self.assertEqual((home / 'scripts' / 'build_apk_from_nsp.py').read_text(), 'print("the pipeline")\n')
+            self.assertEqual((home / 'scripts' / 'build_apk_from_nsp.py').stat().st_mode & 0o777, 0o644)
+            self.assertEqual((home / 'dm' / 'android' / 'gradlew').stat().st_mode & 0o777, 0o755)   # git's +x, kept
+            self.assertEqual((home / '.payload').read_text().strip(), self.pc.VERSION)   # the stamp
+            self.assertFalse(old.exists())   # the engine of a version that is gone went with it
+            seen2 = []
+            self.assertEqual(self.pc.ensure_payload(progress=seen2.append), home)
+            self.assertEqual(seen2, [])   # the second call does nothing: the stamp already says so
+
+    def test_no_payload_is_an_explanation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'repo' / self.pc.VERSION
+            self.frozen(payload_home=lambda: home, payload_ready=lambda: False, payload_zip=lambda: None)
+            with self.assertRaises(RuntimeError) as cm:
+                self.pc.ensure_payload()
+            self.assertIn('re-download', str(cm.exception))
+
+    def test_the_report_names_the_engine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pz = self.fake_payload(tmp)
+            home = Path(tmp) / 'repo' / self.pc.VERSION
+            which = lambda name: f'/bin/{name}'
+            self.frozen(payload_zip=lambda: pz, payload_home=lambda: home,
+                        payload_ready=lambda: (home / '.payload').is_file())
+            with unittest.mock.patch.object(self.pc.shutil, 'which', which), \
+                 unittest.mock.patch.object(self.pc, 'run_out', return_value=(0, '')), \
+                 unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': ''}):
+                row = next(r for r in self.pc.tool_report({}) if r['name'] == 'the build engine')
+                self.assertTrue(row['ok']); self.assertIn('unpacks to', row['detail'])   # bundled, not yet unpacked
+                home.mkdir(parents=True); (home / '.payload').write_text(self.pc.VERSION)
+                row = next(r for r in self.pc.tool_report({}) if r['name'] == 'the build engine')
+                self.assertTrue(row['ok']); self.assertIn('unpacked at', row['detail'])
+                self.frozen(payload_zip=lambda: None, payload_home=lambda: home, payload_ready=lambda: False)
+                with unittest.mock.patch.object(self.pc, 'repo_dir', lambda cfg=None: Path('/nowhere')):   # no checkout around either
+                    row = next(r for r in self.pc.tool_report({}) if r['name'] == 'the build engine')
+                self.assertFalse(row['ok']); self.assertIn('re-download', row['fix'])   # a broken build says so
+
+
 class FreezeLists(unittest.TestCase):
     """freeze.py's module lists against what the pipeline actually imports: every third-party package
     any script the companion runs (itself, in place of python3) may import must be carried inside the
@@ -523,6 +638,15 @@ class FreezeLists(unittest.TestCase):
     def test_the_mac_build_is_universal(self):
         src = (REPO / 'dm/android/tools/freeze.py').read_text()
         self.assertIn('universal2', src)   # the repository's own translator binaries are; the build matches
+
+    def test_the_payload_is_the_tree_with_its_modes(self):
+        files = {p: m for m, p in self.fz.payload_files()}   # the path is the key: one mode per file
+        self.assertIn('scripts/build_apk_from_nsp.py', files)   # the pipeline
+        self.assertIn('dm/android/gradlew', files)              # the app build
+        self.assertIn('dm/games/game.py', files)                # the profiles' reader
+        self.assertEqual(files['dm/android/gradlew'], 0o755)     # git's +x, whatever the runner's disk did with it
+        self.assertFalse(any(p.startswith('docs/') or p.startswith('.github/') for p in files))   # no build reads those
+        self.assertTrue(any(p.startswith('dm/games/') for p in files))   # the game profiles ride along
 
 
 class ProgressFile(unittest.TestCase):

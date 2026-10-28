@@ -15,3 +15,4 @@ dm/android/app/.cxx/
 # The standalone companion (dm/android/tools/freeze.py)
 dist/
 build/
+staging/
