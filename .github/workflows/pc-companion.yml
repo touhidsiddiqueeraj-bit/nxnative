@@ -63,11 +63,15 @@ jobs:
             Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;   # a folder build: no extraction per process
             *) EXE=staging/nxcompanion/nxcompanion ;;   # a folder build on Linux too
           esac
+          # A windowed app (Windows, the Mac) has no stdout even through a redirect - the smoke
+          # reads only exit codes and files, never the app's print output. The report's own 'not
+          # ready' on a bare runner is exit 1; anything else is a crash.
           "$EXE" --check > check-out.txt 2>&1 && rc=0 || rc=$?
-          # exit 1 is the report's own 'not ready' on a bare runner; anything else is a crash
           [ "$rc" -le 1 ] || { cat check-out.txt; exit "$rc"; }
           echo "--check exited $rc (0 ready, 1 not ready on a bare runner)"
-          grep -F 'the build engine' check-out.txt   # the engine row: carried and unpacked, never 'missing'
+          STAMP=$(find "$HOME/.nxcompanion/repo" -maxdepth 2 -name .payload | head -1)
+          test -n "$STAMP"   # the engine really unpacked (--check does it when nothing has yet)
+          echo "the build engine unpacked: $(dirname "$STAMP")"
       - name: "Smoke: the payload's own pipeline script runs inside it"
         shell: bash
         run: |
@@ -79,10 +83,11 @@ jobs:
           esac
           # the engine --check unpacked into ~/.nxcompanion/repo/<version>: its script must run in
           # the executable as python3 would run it (run_as_python), or every build on a user's
-          # machine dies before the first stage
+          # machine dies before the first stage. Its exit code is the proof (--help exits 0; a
+          # windowed app prints nowhere, so its stdout is not read).
           PAYLOAD_SCRIPT=$(find "$HOME/.nxcompanion/repo" -maxdepth 3 -name build_apk_from_nsp.py | head -1)
           test -n "$PAYLOAD_SCRIPT"
-          "$EXE" "$PAYLOAD_SCRIPT" --help | grep -F 'NSP'
+          "$EXE" "$PAYLOAD_SCRIPT" --help
           echo "the payload's script ran: $PAYLOAD_SCRIPT"
       - name: "Smoke: the pipeline's modules and workers run inside it"
         shell: bash
