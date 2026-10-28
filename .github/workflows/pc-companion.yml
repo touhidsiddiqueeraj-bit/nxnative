@@ -58,7 +58,7 @@ jobs:
           set -eu
           case "${{ runner.os }}" in
             macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
-            Windows) EXE=staging/nxcompanion.exe ;;
+            Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;   # a folder build: no extraction per process
             *) EXE=staging/nxcompanion ;;
           esac
           "$EXE" --check && rc=0 || rc=$?
@@ -72,7 +72,7 @@ jobs:
           set -eu
           case "${{ runner.os }}" in
             macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
-            Windows) EXE=staging/nxcompanion.exe ;;
+            Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;
             *) EXE=staging/nxcompanion ;;
           esac
           cat > smoke_modules.py <<'EOF'
@@ -88,10 +88,6 @@ jobs:
           "$EXE" smoke_modules.py
           cat smoke-modules.txt
           echo "smoke: the spawn pool (the shader split's worker mechanism)..."
-          if [ "${{ runner.os }}" = Windows ]; then
-            echo 'smoke: the pool runs in the diagnosis step below on Windows'
-            exit 0
-          fi
           cat > smoke_pool.py <<'EOF'
           # a spawn child re-runs a windowed executable; freeze_support must answer it
           import multiprocessing
@@ -121,15 +117,13 @@ jobs:
         run: |
           set -eu
           V=$(python3 -c 'import re; print(re.search(r"VERSION = .([0-9.]+).", open("dm/android/tools/pc_companion.py").read()).group(1))')
-          cd staging
           if [ "${{ runner.os }}" = Windows ]; then
-            tar -a -cf "../nxcompanion-$V-${{ matrix.name }}.zip" nxcompanion.exe   # bsdtar: -a picks zip from the extension
+            tar -a -cf "nxcompanion-$V-${{ matrix.name }}.zip" -C staging/nxcompanion nxcompanion.exe _internal   # the folder build
           elif [ "${{ runner.os }}" = macOS ]; then
-            tar czf "../nxcompanion-$V-${{ matrix.name }}.tar.gz" nxcompanion.app
+            tar czf "nxcompanion-$V-${{ matrix.name }}.tar.gz" -C staging nxcompanion.app
           else
-            tar czf "../nxcompanion-$V-${{ matrix.name }}.tar.gz" nxcompanion
+            tar czf "nxcompanion-$V-${{ matrix.name }}.tar.gz" -C staging nxcompanion
           fi
-          cd ..
           ls -lh nxcompanion-*
       - name: Diagnose a Windows hang in the spawn children
         if: runner.os == 'Windows'
@@ -150,7 +144,7 @@ jobs:
               note(f'this is {sys.executable}, start method {multiprocessing.get_start_method()}')
               multiprocessing.set_start_method('spawn', force=True)
               p = multiprocessing.Process(target=work, args=(21,))
-              p.start(); p.join(60)
+              p.start(); p.join(120)
               note(f'the Process exited with {p.exitcode}')
               from concurrent.futures import ProcessPoolExecutor
               with ProcessPoolExecutor(1) as ex:
@@ -168,7 +162,7 @@ jobs:
           except subprocess.TimeoutExpired:
               print(f'{sys.argv[1]} STILL RUNNING after {time.time()-t0:.0f}s'); sys.exit(1)
           EOF
-          for exe in staging/nxcompanion.exe diag-staging/nxcompanion.exe; do
+          for exe in staging/nxcompanion/nxcompanion.exe diag-staging/nxcompanion/nxcompanion.exe; do
             echo "probing $exe..."
             rm -f diag/probe.txt
             python3 diag_watch.py "$exe" || true

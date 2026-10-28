@@ -104,13 +104,19 @@ def main(argv):
     # terminal it was run from, see _attach_console); on Linux a console app, so --check prints
     # from a terminal and the window opens from the file manager just the same.
     windowed = sys.platform in ('win32', 'darwin') and not console
+    # One file on the Mac and Linux; on Windows a folder (nxcompanion.exe and _internal beside it):
+    # a onefile child re-extracts the whole 135 MB for every process it starts, and Defender's
+    # real-time scan makes that minutes per worker (the shader split starts dozens of them) - a
+    # folder starts every process instantly, and unpacking a zip is one step either way.
+    onefile = sys.platform != 'win32'
     universal = False
     if sys.platform == 'darwin':
         universal = fatten()   # the wheel-makers' thin native modules get their other arch
         if not universal: sys.exit('the universal2 Mac build needs every native module fat (see fatten above)')
-    cmd = [sys.executable, '-m', 'PyInstaller', '--onefile', '--noconfirm', '--clean',
+    cmd = [sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
            '--name', NAME, '--distpath', str(out), '--workpath', str(REPO / 'build' / 'nxcompanion'),
            '--specpath', str(REPO / 'build' / 'nxcompanion'),
+           *( ['--onefile'] if onefile else [] ),
            *( ['--windowed'] if windowed else [] ),
            *( ['--target-architecture', 'universal2'] if universal else [] ),
            *(a for h in HIDDEN for a in ('--hidden-import', h)),
@@ -119,7 +125,7 @@ def main(argv):
     print(' '.join(cmd))
     r = subprocess.run(cmd, cwd=str(REPO))
     if r.returncode: sys.exit(r.returncode)
-    exe = out / (NAME + ('.exe' if os.name == 'nt' else ''))
+    exe = (out / NAME / (NAME + '.exe')) if (os.name == 'nt' and not onefile) else out / (NAME + ('.exe' if os.name == 'nt' else ''))
     app = out / f'{NAME}.app' if sys.platform == 'darwin' else None
     got = app if (app and app.exists()) else exe
     if not got.exists(): sys.exit(f'no output at {got}')

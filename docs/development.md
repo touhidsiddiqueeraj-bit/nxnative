@@ -139,9 +139,12 @@ per platform. What the freeze does beyond the default:
 users as a run-time failure of the standalone build only. The Mac build is
 universal2, matching the repository's own translator binaries — the wheel
 makers' thin native modules (lz4, the zstd backport) get their other arch
-lipo'd in first, from the other arch's PyPI wheel (`fatten` in freeze.py);
-the Windows build is a window app (`--check` attaches to the terminal it was
-run from), the Linux build a console one.
+lipo'd in first, from the other arch's PyPI wheel (`fatten` in freeze.py).
+The Windows build is a window app in a folder (`nxcompanion.exe` with
+`_internal` beside it, not one file: a onefile child re-extracts the whole
+bundle for every process it starts, and Defender's real-time scan turns the
+shader split's dozens of workers into minutes of dead time each); `--check`
+attaches to the terminal it was run from. The Linux build is a console one.
 
 ## The packing script in detail
 
