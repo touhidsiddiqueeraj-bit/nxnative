@@ -99,9 +99,13 @@ jobs:
           try:
               r = subprocess.run([sys.argv[1], 'diag_probe.py'], capture_output=True, timeout=180, env=env)
               print(f'{sys.argv[1]} exit {r.returncode} after {time.time()-t0:.0f}s')
+              if r.stdout: print('--- stdout:'); print(r.stdout.decode('utf-8', 'replace')[-3000:])
+              if r.stderr: print('--- stderr:'); print(r.stderr.decode('utf-8', 'replace')[-3000:])
               sys.exit(r.returncode or 0)
-          except subprocess.TimeoutExpired:
-              print(f'{sys.argv[1]} STILL RUNNING after {time.time()-t0:.0f}s'); sys.exit(1)
+          except subprocess.TimeoutExpired as e:
+              print(f'{sys.argv[1]} STILL RUNNING after {time.time()-t0:.0f}s')
+              if e.stdout: print('--- partial stdout:'); print((e.stdout or b'').decode('utf-8', 'replace')[-2000:])
+              sys.exit(1)
           EOF
           for exe in staging/nxcompanion/nxcompanion.exe diag-staging/nxcompanion/nxcompanion.exe; do
             echo "probing $exe..."

@@ -936,8 +936,44 @@ def main(argv):
     _trace('main entered')
     if FROZEN:
         import multiprocessing
+        from multiprocessing import spawn as mp_spawn
+        # A shader-split worker (ProcessPoolExecutor's spawn start method) re-runs this executable on
+        # Windows; the handshake it then performs has hung there, so it runs here step by step, each
+        # written to the trace file a windowed child can otherwise not talk through (the same calls
+        # multiprocessing's own freeze_support makes, and any failure's traceback ends up in the file).
+        # Everything else - the tracker's '-c' helpers, and every other platform - goes to the stock one.
+        if sys.platform == 'win32' and mp_spawn.is_forking(sys.argv):
+            kwds = {}
+            for arg in sys.argv[2:]:
+                name, value = arg.split('=', 1)
+                kwds[name] = None if value == 'None' else int(value)
+            _trace(f'the spawn worker, kwds {kwds}')
+            try:
+                import msvcrt
+                import _winapi
+                from multiprocessing import context as mp_context
+                source_process = None
+                if 'parent_pid' in kwds:
+                    _trace('opening the parent process')
+                    source_process = _winapi.OpenProcess(_winapi.SYNCHRONIZE | _winapi.PROCESS_DUP_HANDLE,
+                                                         False, kwds.pop('parent_pid'))
+                _trace('duplicating the pipe handle')
+                new_handle = mp_context.reduction.duplicate(kwds['pipe_handle'], source_process=source_process)
+                _trace('wrapping the handle as a file descriptor')
+                fd = msvcrt.open_osfhandle(new_handle, os.O_RDONLY)
+                _trace('reading the pickled process and running it')
+                exitcode = mp_spawn._main(fd, source_process)
+                _trace(f'the worker ran, exitcode {exitcode}')
+                sys.exit(exitcode or 0)
+            except SystemExit:
+                raise
+            except BaseException:
+                import traceback
+                _trace('the spawn handshake failed:\n' + traceback.format_exc())
+                raise
+        _trace('argv: ' + repr(sys.argv))
         _trace('calling freeze_support')
-        multiprocessing.freeze_support()   # a shader-split worker (ProcessPoolExecutor) re-runs this executable as a spawn child on Windows and the Mac; this runs the child instead of the window
+        multiprocessing.freeze_support()   # the tracker's '-c' helpers here, and the worker children on the Mac
         _trace('freeze_support returned (not a spawn child)')
     if argv and argv[0].endswith('.py') and Path(argv[0]).is_file():
         return run_as_python(argv[0], argv[1:])   # the pipeline's helper scripts: run them as python3 would
