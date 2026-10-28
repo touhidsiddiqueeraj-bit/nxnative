@@ -14,10 +14,12 @@ Usage:  python3 dm/android/tools/freeze.py [output dir]        (dist/ under the 
 Needs:  python3 -m pip install pyinstaller lz4 capstone fonttools backports.zstd nsz
        (Python 3.14+ carries zstd itself; freeze with 3.12 for the backport, as the releases do)
 The Mac build is universal2 (the python.org interpreter is, and so are the repository's own
-translator binaries); the Windows build is a window app (--check attaches to the terminal it was
-run from), the Linux build a console one.
+translator binaries): the wheel-makers' thin native modules - lz4, the zstd backport - get their
+other arch lipo'd in first (fatten, from the PyPI wheel of the other arch); the Windows build is
+a window app (--check attaches to the terminal it was run from), the Linux build a console one.
 """
 import os
+import platform
 import subprocess
 import sys
 import shutil
@@ -31,6 +33,7 @@ NAME = 'nxcompanion'
 # are walked dynamically or lazily, and backports.zstd is imported from a try/except in shader_split.py.
 HIDDEN = ['lz4.block', 'lz4.frame'] + (['compression.zstd'] if sys.version_info >= (3, 14) else [])
 COLLECT = ['capstone', 'fontTools', 'nsz'] + ([] if sys.version_info >= (3, 14) else ['backports.zstd'])
+FATTEN = ['lz4', 'capstone', *COLLECT, 'pycryptodome']   # the ones that may carry a native module (nsz pulls pycryptodome)
 
 
 def pyinstaller():
@@ -41,6 +44,44 @@ def pyinstaller():
     return r.stdout.strip()
 
 
+def fatten(packages):
+    """Make the installed native modules universal2, in place: PyInstaller's universal2 build refuses
+    a thin .so, and on the Mac some of the pipeline's wheels ship one arch only (lz4 and the zstd
+    backport; capstone and pycryptodome are fat already). The other arch's wheel is fetched from
+    PyPI and lipo'd into the installed file. Returns False (and says why) when a thin one has no
+    other-arch wheel: the build then cannot be universal2."""
+    import importlib.util, json, tempfile, urllib.request, zipfile
+    other = 'x86_64' if platform.machine() == 'arm64' else 'arm64'
+    py = f'cp{sys.version_info.major}{sys.version_info.minor}'
+    for pkg in packages:
+        spec = importlib.util.find_spec(pkg)
+        if spec is None or not spec.submodule_search_locations: continue
+        root = Path(spec.submodule_search_locations[0])
+        thin = [so for pat in ('*.so', '*.dylib') for so in root.rglob(pat)   # capstone ships a .dylib
+                if other not in subprocess.run(['lipo', '-info', str(so)], capture_output=True, text=True).stdout]
+        if not thin: continue
+        with urllib.request.urlopen(f'https://pypi.org/pypi/{pkg}/json', timeout=30) as f:
+            files = json.load(f)['urls']
+        cand = [f for f in files if f['filename'].endswith(f'_{other}.whl') and 'macosx' in f['filename']
+                and (py in f['filename'] or 'py3-none' in f['filename'] or 'abi3' in f['filename'])]
+        if not cand:
+            print(f'fatten: {pkg} has thin native modules but no {other} wheel on PyPI', file=sys.stderr)
+            return False
+        with tempfile.TemporaryDirectory() as tmp:
+            wheel = Path(tmp) / cand[0]['filename']
+            with urllib.request.urlopen(cand[0]['url'], timeout=300) as r: wheel.write_bytes(r.read())
+            with zipfile.ZipFile(wheel) as z: z.extractall(tmp)
+            tree = Path(tmp).joinpath(*pkg.split('.'))
+            for so in thin:
+                merge = Path(str(so) + '.fat')
+                r = subprocess.run(['lipo', '-create', str(so), str(tree / so.relative_to(root)), '-o', str(merge)])
+                if r.returncode or not merge.is_file():
+                    print(f'fatten: lipo refused {so}', file=sys.stderr); return False
+                shutil.move(merge, so)
+        print(f'fatten: {pkg} is universal2 now ({len(thin)} native module(s) merged)')
+    return True
+
+
 def main(argv):
     out = Path(argv[0]).resolve() if argv else REPO / 'dist'
     version = pyinstaller()
@@ -48,11 +89,15 @@ def main(argv):
     # terminal it was run from, see _attach_console); on Linux a console app, so --check prints
     # from a terminal and the window opens from the file manager just the same.
     windowed = sys.platform in ('win32', 'darwin')
+    universal = False
+    if sys.platform == 'darwin':
+        universal = fatten(FATTEN)   # the wheel-makers' thin native modules get their other arch
+        if not universal: sys.exit('the universal2 Mac build needs every native module fat (see fatten above)')
     cmd = [sys.executable, '-m', 'PyInstaller', '--onefile', '--noconfirm', '--clean',
            '--name', NAME, '--distpath', str(out), '--workpath', str(REPO / 'build' / 'nxcompanion'),
            '--specpath', str(REPO / 'build' / 'nxcompanion'),
            *( ['--windowed'] if windowed else [] ),
-           *( ['--target-architecture', 'universal2'] if sys.platform == 'darwin' else [] ),
+           *( ['--target-architecture', 'universal2'] if universal else [] ),
            *(a for h in HIDDEN for a in ('--hidden-import', h)),
            *(a for c in COLLECT for a in ('--collect-all', c)),
            str(ENTRY)]

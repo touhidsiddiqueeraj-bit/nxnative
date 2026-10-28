@@ -137,9 +137,11 @@ per platform. What the freeze does beyond the default:
 `freeze.py`'s module lists are checked against the pipeline's actual imports by
 `test_pc_companion.py`'s `FreezeLists`, so a new third-party import cannot reach
 users as a run-time failure of the standalone build only. The Mac build is
-universal2, matching the repository's own translator binaries; the Windows
-build is a window app (`--check` attaches to the terminal it was run from),
-the Linux build a console one.
+universal2, matching the repository's own translator binaries — the wheel
+makers' thin native modules (lz4, the zstd backport) get their other arch
+lipo'd in first, from the other arch's PyPI wheel (`fatten` in freeze.py);
+the Windows build is a window app (`--check` attaches to the terminal it was
+run from), the Linux build a console one.
 
 ## The packing script in detail
 
