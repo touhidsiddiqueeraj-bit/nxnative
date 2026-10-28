@@ -1,0 +1,133 @@
+# nxnative's PC companion as standalone executables: the window and the whole build pipeline
+# (run_as_python) in one file per platform - Linux, Windows and a universal2 macOS build - so a
+# user needs no Python of their own for the window. dm/android/tools/freeze.py packs it; the
+# repository itself, bash, make, python3, dotnet, Java and the Android SDK stay outside (the
+# companion's Toolchain window guides them in).
+#
+# CI (pushes and pull requests touching the involved files): the three builds plus two smoke tests
+# each - the --check report runs, and a script handed to the executable imports every third-party
+# module the pipeline uses (lz4, capstone, fontTools, nsz, the zstd binding) and exercises a
+# ProcessPoolExecutor, the shader split's own worker mechanism (a spawn child re-runs a windowed
+# executable; freeze_support answers it).
+#
+# CD (a tag v*): the same builds, packaged (zip on Windows, tar.gz elsewhere) and attached to the
+# GitHub release, named after the version pc_companion.py carries.
+name: pc-companion
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    paths:
+      - 'dm/android/tools/pc_companion.py'
+      - 'dm/android/tools/freeze.py'
+      - 'dm/android/tests/test_pc_companion.py'
+      - 'scripts/build_ipa_from_nsp.py'
+      - 'scripts/build_apk_from_nsp.py'
+      - '.github/workflows/pc-companion.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # the release job attaches the executables to the tag's release
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, name: linux-x86_64 }
+          - { os: windows-latest, name: windows-x64 }
+          - { os: macos-latest, name: macos-universal2 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'   # the version the pipeline's zstd backport targets (3.14+ carries zstd itself)
+      - name: The freeze toolchain
+        run: python3 -m pip install pyinstaller lz4 capstone fonttools backports.zstd nsz
+      - name: Freeze (one executable: the window and the pipeline)
+        run: python3 dm/android/tools/freeze.py staging
+      - name: Smoke: the --check report runs
+        shell: bash
+        run: |
+          set -eu
+          case "${{ runner.os }}" in
+            macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
+            Windows) EXE=staging/nxcompanion.exe ;;
+            *) EXE=staging/nxcompanion ;;
+          esac
+          "$EXE" --check && rc=0 || rc=$?
+          # exit 1 is the report's own 'not ready' on a bare runner; anything else is a crash
+          [ "$rc" -le 1 ] || exit "$rc"
+          echo "--check exited $rc (0 ready, 1 not ready on a bare runner)"
+      - name: Smoke: the pipeline's modules and workers run inside it
+        shell: bash
+        run: |
+          set -eu
+          case "${{ runner.os }}" in
+            macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
+            Windows) EXE=staging/nxcompanion.exe ;;
+            *) EXE=staging/nxcompanion ;;
+          esac
+          cat > smoke_modules.py <<'EOF'
+          # every third-party module the pipeline imports at run time, imported inside the executable
+          import lz4.block, lz4.frame, capstone, capstone.arm64
+          from fontTools.ttLib import TTFont
+          import nsz
+          from backports import zstd
+          zstd.ZstdDecompressor().decompress(zstd.ZstdCompressor().compress(b'zstd inside'))   # shader_split's own call
+          open('smoke-modules.txt', 'w').write('modules ok')
+          EOF
+          "$EXE" smoke_modules.py
+          cat smoke-modules.txt
+          cat > smoke_pool.py <<'EOF'
+          # the shader split's worker mechanism: a spawn child re-runs a windowed executable
+          import multiprocessing
+          from concurrent.futures import ProcessPoolExecutor
+          def twice(x): return x * 2
+          if __name__ == '__main__':
+              multiprocessing.set_start_method('spawn', force=True)
+              with ProcessPoolExecutor(2) as ex:
+                  open('smoke-pool.txt', 'w').write(repr(sorted(ex.map(twice, [1, 2, 3]))))
+          EOF
+          "$EXE" smoke_pool.py
+          grep -F '[2, 4, 6]' smoke-pool.txt
+      - name: Package
+        shell: bash
+        run: |
+          set -eu
+          V=$(python3 -c 'import re; print(re.search(r"VERSION = .([0-9.]+).", open("dm/android/tools/pc_companion.py").read()).group(1))')
+          cd staging
+          if [ "${{ runner.os }}" = Windows ]; then
+            tar -a -cf "../nxcompanion-$V-${{ matrix.name }}.zip" nxcompanion.exe   # bsdtar: -a picks zip from the extension
+          elif [ "${{ runner.os }}" = macOS ]; then
+            tar czf "../nxcompanion-$V-${{ matrix.name }}.tar.gz" nxcompanion.app
+          else
+            tar czf "../nxcompanion-$V-${{ matrix.name }}.tar.gz" nxcompanion
+          fi
+          cd ..
+          ls -lh nxcompanion-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nxcompanion-${{ matrix.name }}
+          path: nxcompanion-*
+          retention-days: 14
+          if-no-files-found: error
+
+  release:
+    name: Attach to the release (tag)
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*

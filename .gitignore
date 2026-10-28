@@ -12,3 +12,6 @@ dm/android/local.properties
 dm/android/.gradle/
 dm/android/app/build/
 dm/android/app/.cxx/
+# The standalone companion (dm/android/tools/freeze.py)
+dist/
+build/

@@ -203,12 +203,17 @@ With an Apple developer account you can instead build and install from Xcode: `-
 
 The same approach on an Android phone: the game's own code runs natively on its ARM chip, Switch graphics rebuilt on Vulkan ([dm/android](dm/android)). A game is packed on the computer as its own APK and installed over USB — nothing of any game is in this repository, and nothing is downloaded onto the phone.
 
-**1. On the computer** (Linux, macOS, or Windows inside WSL2), run the PC companion: it checks the whole toolchain (Java 17+, the Android SDK with its NDK and CMake, .NET, the Python packages) and explains exactly how to install whatever is missing, then watches for the phone over USB.
+**1. On the computer** (Linux, macOS, or Windows), run the PC companion: it checks the whole toolchain (Java 17+, the Android SDK with its NDK and CMake, .NET, the Python packages) and explains exactly how to install whatever is missing, then watches for the phone over USB. Two ways to get it:
+
+- **The standalone build**: download `nxcompanion` for your platform from the [Releases page](https://github.com/touhidsiddiqueeraj-bit/nxnative/releases) — one executable for Windows, macOS or Linux, the window and the whole build pipeline inside, no Python of your own needed for it. Drop it into the repository, or start it anywhere and pick the repository folder once (the **Repository** button): the build runs inside it.
+- **From source**: a Python 3.10+ that needs nothing installed for the window itself.
 
 ```
 git clone https://github.com/touhidsiddiqueeraj-bit/nxnative.git && cd nxnative
 python3 dm/android/tools/pc_companion.py
 ```
+
+On Windows the window runs by itself; the build steps want bash, make and python3 (MSYS2 provides all three — or run the whole build inside WSL2), and adb sees a USB phone once usbipd-win attaches it (the Toolchain page has the commands).
 
 **2. On the phone**, turn on USB debugging (Settings, About phone, tap Build number seven times; then Settings, Developer options, USB debugging) and plug it in. The **receiver screen** rises on the phone: it shows the connection, then follows the build live — every stage, the shader counts, the install — and ends with "installed, tap the game's icon". It needs the receiver app on the phone once: when there is none, the companion offers to build and install it (the empty template, `org.nxnative.shell`; every game then lands beside it as its own app). Unplugging drops the screen back to "waiting for the computer"; plugging in again raises it back — no restarts, no taps.
 

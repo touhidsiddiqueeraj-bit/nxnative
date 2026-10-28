@@ -16,25 +16,40 @@ a step the build waits on: pull the cable mid-build and everything on the comput
 Usage (Python 3.10+, no pip packages needed for the window itself):
     python3 dm/android/tools/pc_companion.py          the window
     python3 dm/android/tools/pc_companion.py --check  the same toolchain and device report on stdout
-Windows: run it inside WSL2 (wsl --install from PowerShell); WSLg shows this window on the desktop,
-and adb inside WSL sees a USB phone once usbipd-win attaches it (the toolchain page has the commands).
+The standalone builds (the Releases page; dm/android/tools/freeze.py) are the same app with its
+own Python inside - nxcompanion for Linux, the Mac and Windows - and the build pipeline runs in
+them too: they still need the repository (the pipeline, the translator and the app's build files
+live there), so run the executable inside a checkout or point it at one once (--repo, or the
+Repository button in the window). Windows: the window runs by itself; the build steps want bash,
+make and python3 (MSYS2 provides them, or the whole build inside WSL2), and adb sees a USB phone
+once usbipd-win attaches it (the toolchain page has the commands).
 """
 import argparse
 import json
 import os
 import queue
 import re
+import runpy
 import secrets
 import select
 import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[3]
+FROZEN = hasattr(sys, 'frozen')   # a standalone build (dm/android/tools/freeze.py): this file is the app, not a checkout
+REPO = Path.cwd() if FROZEN else Path(__file__).resolve().parents[3]
+   # from source: the checkout this file lives in; a standalone build finds the repository another way
+   # (repo_dir: the config's folder, NXC_REPO, the executable's folder or the working directory - its
+   # __file__ is inside the build's own bundle, not a checkout, and has no repository around it)
+VERSION = '1.0.0'   # the standalone builds' version (freeze.py names the releases after it)
+NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if (sys.platform == 'win32' and FROZEN) else 0
+   # the standalone Windows build is a window app: without the flag every console child it spawns
+   # (adb, java, gradlew, ...) flashes its own console window; the output flows through the pipes as before
 CONFIG_DIR = Path(os.environ.get('NXC_HOME') or Path.home() / '.nxcompanion')
 NDK_VERSION, CMAKE_VERSION, PLATFORM, BT_MIN = '26.3.11579264', '3.22.1', 'android-34', 35 * 10000   # what dm/android builds with (build.gradle.kts); BT_MIN: build-tools 35.0.0, the first whose zipalign knows -P 16
 LANGUAGES = ['en-US', 'ja', 'fr', 'de', 'es', 'zh-Hans', 'zh-Hant', 'ko', 'it', 'pt-BR', 'ru']   # -l takes any code; these are the common ones
@@ -62,6 +77,7 @@ def load_config(home=None):
     cfg.setdefault('store_password', ''); cfg.setdefault('key_password', '')
     cfg.setdefault('language', 'en-US'); cfg.setdefault('show_fps', True); cfg.setdefault('app_name', '')
     cfg.setdefault('last_nsp', ''); cfg.setdefault('last_keys', '')
+    cfg.setdefault('repo', '')   # a standalone build's repository folder (from source it is this checkout)
     return cfg
 
 
@@ -78,6 +94,33 @@ def save_config(cfg, home=None):
 def _importable(name):
     try: __import__(name); return True
     except ImportError: return False
+
+
+def _is_repo_dir(p):
+    p = Path(p)
+    return (p / 'scripts' / 'build_apk_from_nsp.py').is_file() and (p / 'dm' / 'android').is_dir()
+
+
+def find_repo_around(start):
+    """The nxnative repository at or above a folder."""
+    start = Path(start).resolve()
+    for cand in [start, *start.parents]:
+        if _is_repo_dir(cand): return cand
+    return None
+
+
+def repo_dir(cfg=None):
+    """Where the repository is. From source, the checkout this file lives in; a standalone build
+    takes it from the config, NXC_REPO, or the folder it was launched from (the executable is
+    usually dropped into a checkout, whose scripts, translator and Gradle files the build runs)."""
+    if not FROZEN: return REPO
+    for cand in [cfg.get('repo') if cfg else None, os.environ.get('NXC_REPO'),
+                 Path(sys.executable).parent, os.getcwd()]:
+        if not cand: continue
+        if _is_repo_dir(cand): return Path(cand)
+        around = find_repo_around(cand)
+        if around: return around
+    return REPO   # nothing found: the report's repository row says what is missing
 
 
 def sdk_status(sdk):
@@ -129,32 +172,49 @@ def java_version(output):
 def tool_report(cfg, which=shutil.which):
     """The whole guided list: what is there, what is missing, and the fix for each miss."""
     rows = []
-    py_miss = [m for m in ('lz4.block', 'capstone', 'fontTools') if not _importable(m)] + \
-              ([] if _importable('compression.zstd') or _importable('backports.zstd') else ['backports.zstd'])
-    rows.append({'name': 'Python packages', 'ok': not py_miss,
-                 'detail': f'in {sys.executable}' if not py_miss else 'missing ' + ', '.join(py_miss),
-                 'fix': None if not py_miss else 'pip install lz4 capstone fonttools' + (' backports.zstd' if sys.version_info < (3, 14) else ''),
-                 'fix_cmd': None if not py_miss else [sys.executable, '-m', 'pip', 'install', 'lz4', 'capstone', 'fonttools'] + (['backports.zstd'] if sys.version_info < (3, 14) else [])})
-    for tool, how in (('bash', 'everywhere on the Mac and Linux; on Windows this app runs in WSL2'),
-                      ('make', 'the Xcode command line tools on the Mac (xcode-select --install), build-essential on Ubuntu'),
-                      ('zstd', 'brew install zstd, or apt install zstd'),
+    repo = repo_dir(cfg)
+    rows.append({'name': 'the repository', 'ok': _is_repo_dir(repo),
+                 'detail': str(repo) if _is_repo_dir(repo) else 'not found - the build runs inside it',
+                 'fix': None if _is_repo_dir(repo) else 'clone or download the repository, then pick its folder (the Repository button, or --repo)',
+                 'fix_cmd': None})
+    if FROZEN:
+        py3 = which('python3')   # the Gradle and shell build steps run system python3; the pipeline's own modules are carried inside
+        rows.append({'name': 'python3', 'ok': bool(py3),
+                     'detail': f'{py3} (the build steps run it; the pipeline\'s Python is inside this app)' if py3 else 'missing - the Gradle and shell build steps run python3',
+                     'fix': None if py3 else 'any Python 3 (python.org, the package manager, MSYS2 or the Store alias on Windows)',
+                     'fix_cmd': None})
+    else:
+        py_miss = [m for m in ('lz4.block', 'capstone', 'fontTools') if not _importable(m)] + \
+                  ([] if _importable('compression.zstd') or _importable('backports.zstd') else ['backports.zstd'])
+        rows.append({'name': 'Python packages', 'ok': not py_miss,
+                     'detail': f'in {sys.executable}' if not py_miss else 'missing ' + ', '.join(py_miss),
+                     'fix': None if not py_miss else 'pip install lz4 capstone fonttools' + (' backports.zstd' if sys.version_info < (3, 14) else ''),
+                     'fix_cmd': None if not py_miss else [sys.executable, '-m', 'pip', 'install', 'lz4', 'capstone', 'fonttools'] + (['backports.zstd'] if sys.version_info < (3, 14) else [])})
+    for tool, how in (('bash', 'everywhere on the Mac and Linux; on Windows MSYS2 or Git Bash provide it (or the whole build in WSL2)'),
+                      ('make', 'the Xcode command line tools on the Mac (xcode-select --install), build-essential on Ubuntu, MSYS2 on Windows'),
+                      ('zstd', 'brew install zstd, apt install zstd, or winget install zstd'),
                       ('dotnet', 'the .NET SDK 10: brew install --cask dotnet-sdk, or see dotnet.microsoft.com/download')):
         found = which(tool)
         rows.append({'name': tool, 'ok': bool(found), 'detail': str(found or '-'), 'fix': None if found else how, 'fix_cmd': None})
     jv = which('java')
     jver = None
     if jv:
-        try: jver = java_version(subprocess.run([jv, '-version'], capture_output=True, text=True, timeout=30).stderr or '')
+        try: jver = java_version(subprocess.run([jv, '-version'], capture_output=True, text=True, timeout=30, creationflags=NO_WINDOW).stderr or '')
         except (OSError, subprocess.SubprocessError): pass
     rows.append({'name': 'Java 17+', 'ok': bool(jv and jver and jver >= 17),
                  'detail': f'{jv} (version {jver})' if jv else '-',
                  'fix': None if jv and jver and jver >= 17 else 'Gradle needs Java 17+: brew install --cask temurin@17, or see adoptium.net (Windows: inside WSL)', 'fix_cmd': None})
     rows.append(sdk_status(cfg.get('sdk') or os.environ.get('ANDROID_HOME')))
-    xlate = REPO / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
-    scross = REPO / 'dm/gfx/tools/spirv_cross_bin/spirv-cross'
-    rows.append({'name': 'the repository\'s translator and spirv-cross', 'ok': xlate.exists() and scross.exists(),
-                 'detail': 'in the checkout' if xlate.exists() and scross.exists() else 'missing from the checkout',
-                 'fix': None if xlate.exists() and scross.exists() else 'git checkout / clone the repository again', 'fix_cmd': None})
+    xlate = repo / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
+    scross = repo / 'dm/gfx/tools/spirv_cross_bin/spirv-cross'
+    both = xlate.is_file() and scross.is_file()
+    runnable = both and (sys.platform == 'darwin' or not run_out([str(xlate), '--source-sha'], timeout=30)[0])
+    rows.append({'name': 'the repository\'s translator and spirv-cross', 'ok': runnable,
+                 'detail': ('in the checkout' if both else 'missing from the checkout') +
+                           ('' if runnable or not both else ' - they are macOS binaries; they cannot run here'),
+                 'fix': None if runnable else ('git checkout / clone the repository again' if not both else
+                         'they are the Mac binaries the shader chain is locked to: a game\'s shader step needs a Mac today, the steps before it run here'),
+                 'fix_cmd': None})
     return rows
 
 
@@ -180,15 +240,18 @@ def parse_devices(text):
 def list_devices(cfg):
     adb = adb_path(cfg)
     if not adb: return None   # no adb at all: the toolchain page is where that is fixed
-    try: r = subprocess.run([adb, 'devices', '-l'], capture_output=True, text=True, timeout=15)
+    try: r = subprocess.run([adb, 'devices', '-l'], capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW)
     except (OSError, subprocess.SubprocessError): return []
     return parse_devices(r.stdout)
 
 
 # ---- The build: one command, the APK it leaves, and the three that finish it ----
 
-def pipeline_command(nsp_dir, keys, language=None, show_fps=True, app_name=None):
-    cmd = [sys.executable, str(REPO / 'scripts' / 'build_apk_from_nsp.py'), str(nsp_dir), '-k', str(keys)]
+def pipeline_command(nsp_dir, keys, language=None, show_fps=True, app_name=None, repo=None):
+    """The pipeline as one command. From source it is python3 + the script; a standalone companion
+    runs the script in itself (the executable takes a .py as its first argument - run_as_python)."""
+    repo = repo or repo_dir()
+    cmd = [sys.executable, str(repo / 'scripts' / 'build_apk_from_nsp.py'), str(nsp_dir), '-k', str(keys)]
     if language: cmd += ['-l', language]
     if app_name: cmd += ['--app-name', app_name]
     if not show_fps: cmd += ['--no-show-fps']
@@ -383,7 +446,7 @@ class PhoneLink(threading.Thread):
 
 def run_out(cmd, env=None, timeout=None):
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout)
+        r = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=timeout, creationflags=NO_WINDOW)
         return r.returncode, (r.stdout or '') + (r.stderr or '')
     except (OSError, subprocess.SubprocessError) as e:
         return 1, str(e)
@@ -408,12 +471,83 @@ def ensure_keystore(cfg, log=lambda m: None):
 
 # ---- --check: the same report on stdout, for the terminal and for the tests ----
 
+def _attach_console():
+    """A standalone Windows build is a window app: launched from a terminal it attaches to that
+    terminal so --check prints there (an Explorer launch has no console; a pipe keeps its own
+    handle, so a parent reading the output is never cut off either)."""
+    if sys.platform != 'win32' or not FROZEN or sys.stdout is None: return
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.AttachConsole(-1):   # ATTACH_PARENT_PROCESS
+            sys.stdout = open('CONOUT$', 'w', encoding='utf-8', errors='replace')
+            sys.stderr = sys.stdout
+    except (OSError, AttributeError, ValueError): pass
+
+
+def run_as_python(script, args):
+    """Run a repository script exactly as python3 would, in this process. A standalone companion
+    is the pipeline's interpreter: every helper the pipeline spawns is [this executable, <script.py>,
+    ...] - the same shape it used for python itself - and this runs it with the script's folder
+    first on sys.path, its own sys.argv, and __name__ == '__main__'."""
+    if sys.stdout is None:   # a windowed build carries no stdout of its own; when the parent gave the
+        # process one (a pipe), fd 1 is still there to take over, and the pipeline's events flow through it
+        try: sys.stdout = open(1, 'w', encoding='utf-8', errors='replace', closefd=False)
+        except (OSError, ValueError): sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
+    if sys.stderr is None: sys.stderr = sys.stdout
+    script = str(Path(script).resolve())
+    sys.path.insert(0, str(Path(script).parent))
+    sys.argv = [script, *args]
+    try:
+        runpy.run_path(script, run_name='__main__')
+    except SystemExit as e:
+        return e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+    except BaseException:   # a windowed child has no stderr to print a crash on: the traceback goes to the
+        # event file the driver reads (when this is the pipeline), then on to whoever else can hear it
+        import traceback
+        tb = traceback.format_exc()
+        pf = os.environ.get('PROGRESS_FILE')
+        if pf:
+            try:
+                with open(pf, 'a', encoding='utf-8') as f: f.write(json.dumps({'ev': 'say', 'msg': tb.rstrip()[-4000:]}) + '\n')
+            except OSError: pass
+        try: sys.stderr.write(tb)
+        except (OSError, ValueError, AttributeError): pass
+        raise
+    return 0
+
+
+def follow_lines(path, proc):
+    """The pipeline's event lines from its PROGRESS_FILE, one by one and in order: the file may not
+    exist yet (it is created on the first event), and the reader stops only once the pipeline has
+    exited and the file has nothing more. A standalone build reads this instead of the child's
+    stdout: a windowed executable has none even through a pipe (the bootloader wires none)."""
+    f = None
+    try:
+        while True:
+            if f is None:
+                if path.is_file(): f = open(path, encoding='utf-8', errors='replace')
+                elif proc.poll() is not None: return   # no events at all
+                else: time.sleep(0.25); continue
+            line = f.readline()
+            if line: yield line; continue
+            if proc.poll() is not None:
+                time.sleep(0.1); line = f.readline()   # the last write can land just before the exit
+                if line: yield line
+                return
+            time.sleep(0.25)
+    finally:
+        if f is not None: f.close()
+
+
 def run_check(argv):
+    _attach_console()
     cfg = load_config()
     if argv.sdk:
         cfg['sdk'] = str(Path(argv.sdk).resolve()); save_config(cfg)
+    if argv.repo:
+        cfg['repo'] = str(Path(argv.repo).resolve()); save_config(cfg)
     rows = tool_report(cfg)
-    print(f'nxnative PC companion - toolchain report ({sys.platform})')
+    print(f'nxnative PC companion {VERSION} - toolchain report ({sys.platform})')
     for r in rows:
         print(f"  {'ok  ' if r['ok'] else 'MISS'} {r['name']}: {r['detail']}")
         if not r['ok'] and r['fix']: print(f'        fix: {r["fix"]}')
@@ -477,6 +611,7 @@ def run_gui(argv):
             self.b_tools = tk.Label(state, text='\u25cf ?', fg='#888'); self.b_tools.pack(side='left')
             self.b_setup = ttk.Button(state, text='Toolchain\u2026', command=self.open_setup); self.b_setup.pack(side='left', padx=(8, 0))
             self.b_sdk = ttk.Button(state, text='SDK path\u2026', command=self.pick_sdk); self.b_sdk.pack(side='left', padx=(4, 0))
+            self.b_repo = ttk.Button(state, text='Repository\u2026', command=self.pick_repo); self.b_repo.pack(side='left', padx=(4, 0))   # a standalone build's checkout
             # packed only while a phone is plugged in with no nxnative app on it (see drain_events)
             self.b_recv = ttk.Button(state, text='Install receiver app\u2026', command=self.install_receiver)
 
@@ -506,6 +641,10 @@ def run_gui(argv):
             d = filedialog.askdirectory(title='The Android SDK folder (adb, ndk, build-tools inside)', parent=self)
             if d:
                 cfg.update(sdk=d); save_config(cfg); self.refresh_tools()
+        def pick_repo(self):
+            d = filedialog.askdirectory(title='The nxnative repository folder (scripts and dm inside)', parent=self)
+            if d:
+                cfg.update(repo=d); save_config(cfg); self.refresh_tools()
 
         def refresh_tools(self):
             rows = tool_report(cfg)
@@ -593,7 +732,7 @@ def run_gui(argv):
             """The template build for a phone with no nxnative app on it: the same Gradle the games
             go through (no game staged, the shell's applicationId), then the same align-sign-install."""
             q = self.queue
-            android = REPO / 'dm' / 'android'
+            android = repo_dir(cfg) / 'dm' / 'android'
             gradlew = android / ('gradlew.bat' if os.name == 'nt' else 'gradlew')
             try:
                 if not gradlew.exists(): raise RuntimeError('no gradlew in the checkout: ' + str(android))
@@ -602,7 +741,7 @@ def run_gui(argv):
                 env['GAME'] = PROFILE   # the host compiles against a committed profile (the template carries no game files; the same GAME the CI workflow sets)
                 cmd = receiver_build_command(gradlew)
                 q.put(('stage', 'building the receiver app (the empty template, no game in it)'))
-                self.proc = subprocess.Popen(cmd, cwd=str(android), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                self.proc = subprocess.Popen(cmd, cwd=str(android), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env, creationflags=NO_WINDOW)
                 for line in self.proc.stdout or []: q.put(('log', line.rstrip()))
                 rc = self.proc.wait(); self.proc = None
                 if rc: raise RuntimeError(f'the template build stopped with exit code {rc} (the lines above say why)')
@@ -654,7 +793,7 @@ def run_gui(argv):
                 rows = tool_report(cfg); render(rows); self.refresh_tools()
             ttk.Button(bar, text='Install the first missing piece', command=run_fix).pack(side='left')
             ttk.Button(bar, text='Check again', command=lambda: (setattr(self, 'setup_rows', tool_report(cfg)), render(self.setup_rows), self.refresh_tools())).pack(side='left', padx=6)
-            ttk.Label(bar, text='Windows: the whole app runs inside WSL2 (wsl --install); WSLg shows this window,\nand adb needs the phone attached with usbipd-win (see the README)', justify='left').pack(side='right')
+            ttk.Label(bar, text='Windows: the window runs by itself; the build steps want bash, make and python3 (MSYS2\nprovides them, or the whole build inside WSL2), and adb needs the phone attached with usbipd-win', justify='left').pack(side='right')
 
         # -- the build --
         def start(self):
@@ -678,14 +817,23 @@ def run_gui(argv):
             """The worker thread: the pipeline, then align-sign-install. Everything reaches the window through the queue."""
             q = self.queue; started = time.time() - 5
             env = dict(os.environ, PROGRESS='json')   # build_apk_from_nsp.py's own events, one JSON object a line
+            prog_file = None
+            if FROZEN:   # a windowed build reads its events from a file: its stdout is not wired even through a pipe
+                prog_file = Path(tempfile.gettempdir()) / f'nxcompanion-{os.getpid()}-{int(time.time())}.jsonl'
+                env['PROGRESS_FILE'] = str(prog_file)
             if cfg.get('sdk'): env['ANDROID_HOME'] = cfg['sdk']
-            cmd = pipeline_command(nsp, keys, lang, fps, app_name)
+            repo = repo_dir(cfg)
+            cmd = pipeline_command(nsp, keys, lang, fps, app_name, repo=repo)
             q.put(('stage', f'building: {" ".join(cmd[1:])}'))
             self.phone({'event': 'status', 'state': 'building', 'stage': 'starting', 'detail': os.path.basename(nsp)})
             try:
-                self.proc = subprocess.Popen(cmd, cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env)
+                self.proc = subprocess.Popen(cmd, cwd=str(repo),
+                                             stdout=subprocess.DEVNULL if prog_file else subprocess.PIPE,
+                                             stderr=subprocess.STDOUT if not prog_file else subprocess.DEVNULL,
+                                             text=True, env=env, creationflags=NO_WINDOW)
+                lines = follow_lines(prog_file, self.proc) if prog_file else (self.proc.stdout or [])
                 last_stage = ''
-                for line in self.proc.stdout or []:
+                for line in lines:
                     ev = None
                     try: ev = json.loads(line)
                     except ValueError: pass
@@ -702,6 +850,9 @@ def run_gui(argv):
                         self.phone({'event': 'status', 'state': 'building', 'stage': last_stage, 'detail': str(ev.get('msg', ''))})
                     else: q.put(('log', line.rstrip()))
                 rc = self.proc.wait(); self.proc = None
+                if prog_file:
+                    try: prog_file.unlink()
+                    except OSError: pass
                 if rc: raise RuntimeError(f'the build stopped with exit code {rc} (the lines above say why)')
                 apks = find_built_apks(nsp, started)
                 if not apks: raise RuntimeError('the build reported success but no APK appeared beside the NSPs')
@@ -771,9 +922,15 @@ def run_gui(argv):
 
 
 def main(argv):
-    ap = argparse.ArgumentParser(prog='pc_companion.py', description='pick the NSPs and prod.keys, get an installed game on the phone (dm/android/tools/pc_companion.py)')
+    if FROZEN:
+        import multiprocessing
+        multiprocessing.freeze_support()   # a shader-split worker (ProcessPoolExecutor) re-runs this executable as a spawn child on Windows and the Mac; this runs the child instead of the window
+    if argv and argv[0].endswith('.py') and Path(argv[0]).is_file():
+        return run_as_python(argv[0], argv[1:])   # the pipeline's helper scripts: run them as python3 would
+    ap = argparse.ArgumentParser(prog='pc_companion', description='pick the NSPs and prod.keys, get an installed game on the phone (dm/android/tools/pc_companion.py)')
     ap.add_argument('--check', action='store_true', help='print the toolchain and device report and exit (no window)')
     ap.add_argument('--sdk', help='remember the Android SDK path (the Toolchain button in the window does the same)')
+    ap.add_argument('--repo', help='remember the repository folder (a standalone build needs it: the Repository button does the same)')
     args = ap.parse_args(argv)
     if args.check: return run_check(args)
     run_gui(args)

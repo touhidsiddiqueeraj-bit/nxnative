@@ -141,18 +141,21 @@ class Toolchain(unittest.TestCase):
     def test_report_with_nothing(self):
         with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': str(Path(tmp) / 'sdk')}):
             with unittest.mock.patch.object(self.pc.shutil, 'which', return_value=None), \
-                 unittest.mock.patch.object(self.pc, '_importable', return_value=False):
+                 unittest.mock.patch.object(self.pc, '_importable', return_value=False), \
+                 unittest.mock.patch.object(self.pc, 'REPO', Path(tmp)):   # a machine with no checkout: the repository row fails too
                 rows = self.pc.tool_report({}, which=lambda name: None)
                 by_name = {r['name']: r for r in rows}
-                self.assertFalse(any(r['ok'] for r in rows if 'translator' not in r['name']))   # the checkout's own binaries stay ok
-                self.assertIn('developer.android.com', by_name['Android SDK']['fix'])   # guided, not just failed
+                self.assertFalse(any(r['ok'] for r in rows))
+                self.assertIn('clone or download the repository', by_name['the repository']['fix'])   # guided, not just failed
+                self.assertIn('developer.android.com', by_name['Android SDK']['fix'])
                 self.assertIn('build-essential', by_name['make']['fix'])
 
     def test_report_with_everything(self):
         with tempfile.TemporaryDirectory() as tmp:
             sdk = self.fake_sdk(tmp)
             with unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': str(sdk)}), \
-                 unittest.mock.patch.object(self.pc, '_importable', return_value=True):
+                 unittest.mock.patch.object(self.pc, '_importable', return_value=True), \
+                 unittest.mock.patch.object(self.pc, 'run_out', return_value=(0, '')):   # the translator probe: on this runner it is the Mac binary
                 rows = self.pc.tool_report({'sdk': str(sdk)}, which=lambda name: f'/bin/{name}')
                 self.assertTrue(all(r['ok'] for r in rows if r['name'] != 'Java 17+'))   # java's version is run for real below
 
@@ -374,6 +377,169 @@ class CheckMode(unittest.TestCase):
         self.assertIn('phone', r.stdout)   # the device line: either a phone, or the guidance
         self.assertIn('not ready', r.stdout)   # this machine has no SDK right now; a ready one says 'ready'
         self.assertEqual(r.returncode, 1)
+
+
+class FrozenMode(unittest.TestCase):
+    """What a standalone build (dm/android/tools/freeze.py) does differently: find the repository from
+    where it was launched instead of around its own file, run the pipeline's scripts inside itself,
+    read the build's events from a file (a windowed executable has no stdout), keep Windows from
+    flashing a console per child, and answer the shader split's spawn children."""
+
+    def setUp(self): self.pc = load_pc()
+
+    def test_from_source_the_repo_is_this_checkout(self):
+        self.assertFalse(self.pc.FROZEN)
+        self.assertEqual(self.pc.repo_dir(), REPO)   # pc_companion.py sits three levels under the root
+
+    def test_a_frozen_app_finds_the_repository_around_it(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = Path(tmp) / 'nxnative'
+            (checkout / 'scripts').mkdir(parents=True); (checkout / 'scripts' / 'build_apk_from_nsp.py').write_text('')
+            (checkout / 'dm' / 'android').mkdir(parents=True)
+            nested = checkout / 'somewhere' / 'deep'; nested.mkdir(parents=True)
+            with unittest.mock.patch.object(self.pc, 'FROZEN', True), \
+                 unittest.mock.patch.object(self.pc, 'REPO', Path('/nowhere')):
+                old = os.getcwd(); os.chdir(nested)
+                try:
+                    self.assertEqual(self.pc.repo_dir(), checkout)   # the launch folder, then its parents
+                    self.assertEqual(self.pc.repo_dir({'repo': ''}), checkout)   # nothing remembered: same walk
+                finally: os.chdir(old)
+                self.assertEqual(self.pc.repo_dir({'repo': str(checkout)}), checkout)   # the Repository button's choice
+
+    def test_the_exe_runs_helpers_as_python3_would(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / 'helper.py'
+            script.write_text('import sys\nprint("argv:", len(sys.argv), sys.argv[0].endswith("helper.py"))\nsys.exit(3)\n')
+            rc = None
+            try: rc = self.pc.run_as_python(script, ['-k', 'prod.keys'])
+            except SystemExit as e: self.fail(f'run_as_python leaked SystemExit {e.code}')
+            self.assertEqual(rc, 3)   # the child's own exit code, not a crash
+            self.assertEqual(sys.path[0], str(Path(script).resolve().parent))   # the script's folder, first, as python3 does
+
+    def test_a_crash_in_a_helper_lands_in_the_events_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / 'boom.py'
+            script.write_text('raise RuntimeError("boom in the pipeline")\n')
+            events = Path(tmp) / 'events.jsonl'
+            env = dict(os.environ, PROGRESS_FILE=str(events))
+            with unittest.mock.patch.dict(os.environ, env):
+                with self.assertRaises(RuntimeError):
+                    self.pc.run_as_python(script, [])
+            lines = [json.loads(l) for l in events.read_text().splitlines()]
+            self.assertTrue(any(e.get('ev') == 'say' and 'RuntimeError: boom in the pipeline' in e.get('msg', '') for e in lines))
+            self.assertTrue(any('traceback' in e.get('msg', '').lower() for e in lines))   # the why, not just the what
+
+    def test_the_events_file_is_followed_from_before_it_exists(self):
+        class Dead:   # a process that is not yet done
+            def __init__(self): self.exits_at = time.time() + 1.2
+            def poll(self): return 0 if time.time() >= self.exits_at else None
+        with tempfile.TemporaryDirectory() as tmp:
+            events = Path(tmp) / 'events.jsonl'
+            def writer():
+                time.sleep(0.3); events.write_text('{"ev": "stage", "name": "one"}\n', encoding='utf-8')
+                time.sleep(0.3)
+                with events.open('a', encoding='utf-8') as f: f.write('{"ev": "say", "msg": "two"}\n')
+            t = threading.Thread(target=writer); t.start()
+            try: got = [l for l in self.pc.follow_lines(events, Dead())]
+            finally: t.join()
+            self.assertEqual(len(got), 2)
+            self.assertIn('"one"', got[0]); self.assertIn('"two"', got[1])   # in order, none lost at the exit
+
+    def test_windows_children_stay_hidden(self):
+        self.assertEqual(self.pc.NO_WINDOW, 0)   # from source, on any platform: children share the console
+        saved_platform, saved_frozen = sys.platform, getattr(sys, 'frozen', None)
+        subprocess.CREATE_NO_WINDOW = 0x08000000   # the Windows-only flag, emulated for the load
+        try:
+            sys.platform = 'win32'; sys.frozen = True
+            win = load_pc()
+            self.assertEqual(win.NO_WINDOW, subprocess.CREATE_NO_WINDOW)   # every child it spawns carries this
+        finally:
+            sys.platform = saved_platform
+            if saved_frozen is None: del sys.frozen
+            else: sys.frozen = saved_frozen
+            del subprocess.CREATE_NO_WINDOW
+        self.assertIn('creationflags=NO_WINDOW', (REPO / 'scripts/build_ipa_from_nsp.py').read_text())   # the pipeline hides its own children the same way
+
+    def test_spawn_children_are_answered_before_anything_else(self):
+        called = []
+        with unittest.mock.patch.object(self.pc, 'FROZEN', True), \
+             unittest.mock.patch('multiprocessing.freeze_support', side_effect=lambda: called.append(1)):
+            with self.assertRaises(SystemExit):   # '--multiprocessing-fork' is no argument of ours: argparse's exit
+                self.pc.main(['--multiprocessing-fork', 'pipe_handle=5'])
+        self.assertEqual(called, [1])   # the spawn child was served before the window or argparse ever ran
+
+
+class FreezeLists(unittest.TestCase):
+    """freeze.py's module lists against what the pipeline actually imports: every third-party package
+    any script the companion runs (itself, in place of python3) may import must be carried inside the
+    executable, or the standalone build fails only on a user's machine, at run time."""
+
+    SCRIPTS = ['scripts/build_apk_from_nsp.py', 'scripts/build_ipa_from_nsp.py',
+               'dm/tools/patch_nso.py', 'dm/tools/nso_code.py', 'dm/tools/nso_asm.py', 'dm/tools/nso_syms.py',
+               'dm/tools/nro_collect.py', 'dm/tools/insn_census.py', 'dm/tools/nacp.py', 'dm/tools/make_ext_font.py',
+               'dm/games/profile_guess.py', 'dm/gfx/tools/shader_split.py', 'dm/gfx/tools/cpk.py',
+               'dm/gfx/tools/unityfs.py', 'dm/gfx/tools/uepak.py', 'dm/gfx/tools/dmsh_chain.py',
+               'dm/gfx/tools/dmsh_build.py', 'dm/gfx/tools/dmsh_geometry.py', 'dm/gfx/tools/dmsh_facts.py',
+               'dm/gfx/tools/dmsh_pull.py', 'dm/gfx/tools/dmsh_vin.py', 'dm/gfx/tools/own_compilers.py',
+               'dm/gfx/tools/shader_regressions.py', 'dm/android/tools/pack_apk.py',
+               'dm/android/tools/gen_build_android.py']
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location('freeze', REPO / 'dm/android/tools/freeze.py')
+        self.fz = importlib.util.module_from_spec(spec); spec.loader.exec_module(self.fz)
+
+    def imports_of(self, path):
+        import ast
+        mods = set()
+        for node in ast.walk(ast.parse(path.read_text())):
+            if isinstance(node, ast.Import):
+                mods.update(a.name.split('.')[0] for a in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                mods.add(node.module.split('.')[0])
+        return mods
+
+    def test_every_third_party_import_is_carried(self):
+        carried = {m.split('.')[0] for m in self.fz.HIDDEN + self.fz.COLLECT}
+        missing = {}
+        repo_dirs = ('scripts', 'dm/tools', 'dm/games', 'dm/gfx/tools', 'dm/android/tools', 'dm/ios/tools')
+        for rel in self.SCRIPTS:
+            p = REPO / rel
+            if not p.is_file(): continue
+            for m in self.imports_of(p):
+                if m in sys.stdlib_module_names or m in ('build_ipa_from_nsp', 'compression'): continue
+                   # 'compression': stdlib from Python 3.14, imported under try/except before that
+                if not any((REPO / d / (m + '.py')).is_file() for d in repo_dirs):   # the repository's own modules run from the checkout
+                    if m not in carried: missing.setdefault(m, []).append(rel)
+        self.assertFalse(missing, f'freeze.py carries none of: {missing}')
+
+    def test_the_lazy_ones_are_listed_by_name(self):
+        self.assertIn('lz4.frame', self.fz.HIDDEN)   # shader_split.py imports it inside a function
+        self.assertIn('lz4.block', self.fz.HIDDEN)    # patch_nso and shader_split, the NSO's compression
+        if sys.version_info >= (3, 14): self.assertIn('compression.zstd', self.fz.HIDDEN)
+        else: self.assertIn('backports.zstd', self.fz.COLLECT)   # shader_split's zstd_mod() imports it lazily
+        for pkg in ('capstone', 'fontTools', 'nsz'):
+            self.assertIn(pkg, self.fz.COLLECT)
+
+    def test_the_mac_build_is_universal(self):
+        src = (REPO / 'dm/android/tools/freeze.py').read_text()
+        self.assertIn('universal2', src)   # the repository's own translator binaries are; the build matches
+
+
+class ProgressFile(unittest.TestCase):
+    """The events file a windowed build reads instead of stdout: build_ipa_from_nsp.py writes every
+    JSON event also there, and only there when the driver sets PROGRESS_FILE."""
+
+    def test_every_event_lands_in_the_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            events = Path(tmp) / 'events.jsonl'
+            with unittest.mock.patch.dict(os.environ, PROGRESS_FILE=str(events)):
+                spec = importlib.util.spec_from_file_location('ipa_progfile', REPO / 'scripts/build_ipa_from_nsp.py')
+                ios = importlib.util.module_from_spec(spec)
+                with unittest.mock.patch('sys.stdout', new=None):   # a windowed child: print can do nothing
+                    spec.loader.exec_module(ios)
+                    ios.PROG._json({'ev': 'say', 'msg': 'one'})
+                    ios.PROG._json({'ev': 'stage', 'k': 1, 'n': 2, 'name': 'two'})
+            self.assertEqual([json.loads(l)['ev'] for l in events.read_text().splitlines()], ['say', 'stage'])
 
 
 if __name__ == '__main__':

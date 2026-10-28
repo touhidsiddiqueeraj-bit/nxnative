@@ -91,6 +91,56 @@ requests, only the checker whose pinned release version increased may gain
 baseline entries or counts. Comments, dependency updates and checker downgrades
 do not allow growth.
 
+`.github/workflows/android.yml` builds the Android app itself (the Python tool
+tests, then Gradle/NDK against a committed game profile, with the 16 KB-page
+checks on the APK), and on a `v*` tag attaches the release APK to the GitHub
+release. `.github/workflows/pc-companion.yml` builds the PC companion's
+standalone executables — one job per platform (Linux, Windows, a universal2
+macOS build) — and attaches them to the same releases.
+
+## The PC companion
+
+`dm/android/tools/pc_companion.py` is the player-facing driver of the Android
+pipeline: a Tkinter window (Python 3.10+, stdlib only) that watches for the
+phone over USB, runs `scripts/build_apk_from_nsp.py` on the picked NSPs, then
+zipaligns (`-P 16`), signs with a personal key made once into `~/.nxcompanion`,
+and `adb install`s. Its `--check` prints the same toolchain report as text. The
+phone side it talks to is the receiver screen (see the README's Play on Android
+section); `dm/android/tests/test_pc_companion.py` covers its logic.
+
+The standalone builds on the Releases page are the same file frozen with
+`dm/android/tools/freeze.py` (PyInstaller onefile): the window, the toolchain
+guidance and the whole build pipeline — every third-party module the pipeline
+imports (lz4, capstone, fontTools, nsz, the zstd binding) — in one executable
+per platform. What the freeze does beyond the default:
+
+- The pipeline's scripts run inside the executable: the companion runs each as
+  `run_as_python` (its first argument being a `.py` file), with the script's
+  folder first on `sys.path` and `__name__ == '__main__'`, so `[sys.executable,
+  <script.py>, ...]` keeps working everywhere it meant `python3`.
+- The shader split's `ProcessPoolExecutor` re-runs a windowed executable for
+  every worker (the spawn start method on Windows and the Mac):
+  `multiprocessing.freeze_support()` at `main()`'s top answers those children.
+- A windowed executable has no stdout even through a pipe, so the build's
+  events (`PROGRESS=json`) go to the `PROGRESS_FILE` the companion tails
+  instead; a crash's traceback is written there too, or the window shows only
+  an exit code.
+- On Windows a window app's console children (adb, java, gradlew, …) each
+  flash their own console window: every subprocess carries
+  `CREATE_NO_WINDOW` (`NO_WINDOW` in the companion and the pipeline's `run()`).
+- The repository stays outside the executable: a standalone build finds it
+  through its config, `NXC_REPO`, the executable's folder or the working
+  directory (`repo_dir`), and the Toolchain page shows it as a row when it
+  is missing. bash, make, python3, zstd, dotnet, Java and the Android SDK
+  stay outside as well — the window guides their installation.
+
+`freeze.py`'s module lists are checked against the pipeline's actual imports by
+`test_pc_companion.py`'s `FreezeLists`, so a new third-party import cannot reach
+users as a run-time failure of the standalone build only. The Mac build is
+universal2, matching the repository's own translator binaries; the Windows
+build is a window app (`--check` attaches to the terminal it was run from),
+the Linux build a console one.
+
 ## The packing script in detail
 
 `scripts/build_ipa_from_nsp.py` (`-h` lists every option):

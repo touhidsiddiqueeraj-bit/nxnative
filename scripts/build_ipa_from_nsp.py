@@ -32,6 +32,24 @@
 import ast, collections, ctypes, getpass, hashlib, importlib.util, json, os, re, shlex, shutil, struct, subprocess, sys, tempfile, threading, time, types, zlib
 from pathlib import Path
 
+NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if (sys.platform == 'win32' and hasattr(sys, 'frozen')) else 0
+   # a standalone companion is a windowed executable: without this flag every console child it spawns
+   # (bash, dotnet, python3, ...) would flash its own console window (the output flows through pipes and
+   # log files either way, so nothing is lost by hiding them)
+PROGRESS_FILE = os.environ.get('PROGRESS_FILE')   # a windowed standalone build has no stdout even through a pipe (the bootloader wires none): its driver reads the same JSON events from this file instead
+_prog_fh = None
+
+
+def _progress_file_line(line):
+    """One event line also into PROGRESS_FILE, opened on first use (a file failure never stops the build)."""
+    global _prog_fh
+    if not PROGRESS_FILE: return
+    try:
+        if _prog_fh is None: _prog_fh = open(PROGRESS_FILE, 'a', encoding='utf-8')
+        _prog_fh.write(line + '\n'); _prog_fh.flush()
+    except OSError: pass
+
+
 # ---- Settings ----
 NSP_DIR = ''                            # folder holding the NSPs (empty = ask at run time)
 PROD_KEYS = ''                          # path of prod.keys (empty = ask at run time)
@@ -172,7 +190,9 @@ class Progress:
 
     def _json(self, obj):   # one JSON object per stdout line (a message's newlines are escaped)
         obj.setdefault('t', round(time.time(), 3))
-        print(json.dumps(obj, ensure_ascii=False, allow_nan=False), flush=True)
+        line = json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        print(line, flush=True)
+        _progress_file_line(line)
 
     def end(self, summary='', ok=True):
         """End the current stage with a ✓ (or ✗) line: its elapsed time and a summary"""
@@ -331,7 +351,7 @@ def run(cmd, log, env=None, cwd=None, on_line=None):
     cmd = [str(c) for c in cmd]
     log.parent.mkdir(parents=True, exist_ok=True)
     tail = collections.deque(maxlen=40)
-    p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', bufsize=1)
+    p = subprocess.Popen(cmd, env=env, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace', bufsize=1, creationflags=NO_WINDOW)
     try:
         with open(log, 'w') as f:
             for line in p.stdout:
@@ -387,7 +407,7 @@ def configure_dotnet(env):
     dn = shutil.which('dotnet', path=env['PATH'])
     if not dn: return
     try:
-        out = subprocess.run([dn, '--list-runtimes'], env=env, capture_output=True, text=True, check=True, timeout=10).stdout
+        out = subprocess.run([dn, '--list-runtimes'], env=env, capture_output=True, text=True, check=True, timeout=10, creationflags=NO_WINDOW).stdout
     except (OSError, subprocess.SubprocessError): return
     for line in out.splitlines():
         m = re.fullmatch(r'Microsoft\.NETCore\.App\s+\S+\s+\[(.+)/shared/Microsoft\.NETCore\.App\]', line.strip())
@@ -474,7 +494,11 @@ def decompress_nsz(nsp_dir, app, fam, keys, env):
             try:
                 # nsz 4.6.1 loads keys.txt beside argv[0] at import time; with argv[0] = 'nsz' that is cwd. That release has no --keys option.
                 (tmp / 'keys.txt').symlink_to(keys.resolve())
-                run([sys.executable, '-c', NSZ_MAIN, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
+                if hasattr(sys, 'frozen'):   # a standalone companion takes no -c: the same code runs from a file handed to the executable as a script
+                    (tmp / 'nsz_main.py').write_text(NSZ_MAIN)
+                    run([sys.executable, tmp / 'nsz_main.py', '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
+                else:
+                    run([sys.executable, '-c', NSZ_MAIN, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
                 if not (tmp / dst.name).is_file(): raise BuildError(f'nsz made no {dst.name} (full output: {log})')
                 (tmp / dst.name).rename(dst)
             finally: rmtree(tmp)
@@ -785,7 +809,7 @@ def fingerprint(*items, env=None):
         elif kind in ('tree', 'stat'):
             for rel, st in files_under(v): h.update(f'{rel}\0{st.st_size}\0{st.st_mtime_ns if kind == "stat" else ""}\n'.encode())
         elif kind == 'cmd':
-            try: r = subprocess.run(v, env=env, capture_output=True, text=True, timeout=120); h.update((r.stdout + r.stderr).encode())
+            try: r = subprocess.run(v, env=env, capture_output=True, text=True, timeout=120, creationflags=NO_WINDOW); h.update((r.stdout + r.stderr).encode())
             except (OSError, subprocess.TimeoutExpired): h.update(b'missing')
         else: h.update(repr(v).encode())
     return h.hexdigest()
@@ -972,7 +996,7 @@ def rewrite(py, repo, exe_dir, out, env, logs, g, provisional=False):
         while todo or procs:
             while todo and len(procs) < cores:
                 m = todo.pop(0); logf[m] = open(logs / f'rewrite_{m}.log', 'w')
-                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=env, stdout=logf[m], stderr=subprocess.STDOUT)
+                procs[m] = subprocess.Popen([str(py), str(repo / 'dm/tools/patch_nso.py'), str(src[m]), str(tmp), m], env=env, stdout=logf[m], stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
             for m in [m for m in procs if procs[m].poll() is not None]:
                 p = procs.pop(m); logf[m].close(); PROG.set(done=len(names) - len(todo) - len(procs))
                 if p.returncode:
@@ -1253,7 +1277,7 @@ def chain_of(repo):   # the chain version dm/gfx/nvn/dmsh_chain.h holds (None wh
 def chain_header(py, repo, env, logs):
     """The chain version header, written again when it no longer holds the version the source tree gives (a chain change committed without dmsh_chain.py --header): dmsh_build.py stops
     on a stale one, and the host and build_ipa.sh read it. The version follows from the source alone (dmsh_chain.py), one for every game (GitHub issue #78: Breath of the Wild after bb585cd)"""
-    r = subprocess.run([str(py), str(repo / 'dm/gfx/tools/dmsh_chain.py')], env=env, capture_output=True, text=True)
+    r = subprocess.run([str(py), str(repo / 'dm/gfx/tools/dmsh_chain.py')], env=env, capture_output=True, text=True, creationflags=NO_WINDOW)
     if r.returncode or not r.stdout.split(): raise BuildError(f'dmsh_chain.py exit code {r.returncode}: {(r.stderr.strip() or "no version")[-500:]}')
     want, have = r.stdout.split()[-1], chain_of(repo)
     if have == want: return
