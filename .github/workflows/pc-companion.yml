@@ -157,18 +157,21 @@ jobs:
                   note(f'the pool says {list(ex.map(work, [21]))}')
               note('done')
           EOF
+          cat > diag_watch.py <<'EOF'
+          # the probe from outside: a windowed child prints nowhere, so the watchdog says what it saw
+          import subprocess, sys, time
+          t0 = time.time()
+          try:
+              r = subprocess.run([sys.argv[1], 'diag_probe.py'], capture_output=True, timeout=180)
+              print(f'{sys.argv[1]} exit {r.returncode} after {time.time()-t0:.0f}s')
+              sys.exit(r.returncode or 0)
+          except subprocess.TimeoutExpired:
+              print(f'{sys.argv[1]} STILL RUNNING after {time.time()-t0:.0f}s'); sys.exit(1)
+          EOF
           for exe in staging/nxcompanion.exe diag-staging/nxcompanion.exe; do
             echo "probing $exe..."
             rm -f diag/probe.txt
-            python3 - "$exe" <<'EOF' || true
-            import subprocess, sys, time
-            t0 = time.time()
-            try:
-                r = subprocess.run([sys.argv[1], 'diag_probe.py'], capture_output=True, timeout=180)
-                print(f'{sys.argv[1]} exit {r.returncode} after {time.time()-t0:.0f}s')
-            except subprocess.TimeoutExpired:
-                print(f'{sys.argv[1]} STILL RUNNING after {time.time()-t0:.0f}s')
-            EOF
+            python3 diag_watch.py "$exe" || true
             echo "--- $exe, diag/probe.txt:"; cat diag/probe.txt 2>/dev/null || echo '(nothing written)'
           done
           exit 0   # the diagnosis never fails the build by itself
