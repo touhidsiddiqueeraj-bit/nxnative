@@ -98,14 +98,15 @@ release. `.github/workflows/pc-companion.yml` builds the PC companion's
 standalone apps — one job per platform (Linux, Windows, a universal2 macOS
 build), each carrying the build-engine payload — and attaches them to the same
 releases. Each job also smokes what it froze: the `--check` report runs (and
-unpacks the payload it carries), the payload's own pipeline script runs inside
-the executable as python3 would run it, and the third-party modules and a
-spawn pool run in it too. The Linux job builds on `ubuntu-24.04`, not
+unpacks the engine it carries inside), the engine's own pipeline script runs
+inside the executable as python3 would run it, and the third-party modules and
+a spawn pool run in it too. The Linux job builds on `ubuntu-24.04`, not
 `ubuntu-latest`: the window's bundled Tcl must run on the LTS distros people
 actually have — a build off the newest image's Python carries a libtcl that
 wants its own brand-new glibc and dies on 24.04 or Debian with a loader error
-(a step asserts no bundled library asks for a GLIBC symbol above 24.04's
-2.39).
+(a step pulls the bundled libraries out of the one-file executable with
+PyInstaller's own archive reader and asserts none asks for a GLIBC symbol
+above 24.04's 2.39).
 
 ## The PC companion
 
@@ -137,18 +138,19 @@ per platform. What the freeze does beyond the default:
 - On Windows a window app's console children (adb, java, gradlew, …) each
   flash their own console window: every subprocess carries
   `CREATE_NO_WINDOW` (`NO_WINDOW` in the companion and the pipeline's `run()`).
-- The build engine travels inside the app: `payload.zip` beside the executable
-  (in `_internal`, or the .app's `Contents/Resources` on the Mac) carries every
-  file git tracks except the docs and the CI workflows, with git's modes
-  (gradlew and the Mac translator binaries keep their execute bit even when the
-  zip is built on a Windows runner, whose disk cannot hold one). On first use
-  the app unpacks it once into `~/.nxcompanion/repo/<version>`
-  (`ensure_payload`): a stamp marks the complete tree, a leftover `.tmp` of a
-  killed run is redone from scratch, and the engine of an older version goes
-  away. `repo_dir` then hands that folder out as the repository — `--repo` (or
-  the config's folder) still points the app at a checkout instead, and a build
-  dropped into one still finds it; the Toolchain page shows the engine as a
-  row, so a broken bundle says "re-download" instead of failing mid-build.
+- The build engine travels inside the app: `payload.zip`, embedded in the
+  executable by the freeze (`--add-data`, landing at `sys._MEIPASS/payload.zip`
+  when the app unpacks itself at start) carries every file git tracks except
+  the docs and the CI workflows, with git's modes (gradlew and the Mac
+  translator binaries keep their execute bit even when the zip is built on a
+  Windows runner, whose disk cannot hold one). On first use the app unpacks it
+  once into `~/.nxcompanion/repo/<version>` (`ensure_payload`): a stamp marks
+  the complete tree, a leftover `.tmp` of a killed run is redone from scratch,
+  and the engine of an older version goes away. `repo_dir` then hands that
+  folder out as the repository — `--repo` (or the config's folder) still points
+  the app at a checkout instead, and a build dropped into one still finds it;
+  the Toolchain page shows the engine as a row, so a broken bundle says
+  "re-download" instead of failing mid-build.
 - bash, make, python3, zstd, dotnet, Java and the Android SDK stay outside:
   the window guides their installation.
 
@@ -159,14 +161,18 @@ a new third-party import cannot reach users as a run-time failure of the
 standalone build only. The Mac build is universal2, matching the repository's
 own translator binaries — the wheel makers' thin native modules (lz4, the
 zstd backport) get their other arch lipo'd in first, from the other arch's
-PyPI wheel (`fatten` in freeze.py). Every platform builds as a folder app
-(onedir; the Mac's is the .app's own bundle): a onefile child re-extracts the
-whole bundle for every process it starts — on Windows, Defender's real-time
-scan turns the shader split's dozens of workers into minutes of dead time each
-— and a folder starts every process instantly, besides giving the payload a
-place to sit where it cannot be separated from the executable. On Windows the
-build is a window app (`--check` attaches to the terminal it was run from);
-on Linux, a console one.
+PyPI wheel (`fatten` in freeze.py). Every platform builds as one file
+(onefile): the app unpacks itself into a private temporary folder once at
+start, and hands that folder down to its children — PyInstaller sets
+`_PYI_APPLICATION_HOME_DIR`, and a child of the same executable that inherits
+it reuses the unpacked copy instead of unpacking itself again — so the dozens
+of helper processes a build spawns (the pipeline script, patch runs per
+module, the shader split's workers) start as fast as a folder build's did,
+without a Defender-scanned unpack each. The Windows release asset is the raw
+`.exe` (download it, run it); Linux a `tar.gz` of the single binary; the Mac
+keeps the one folder a Mac app is allowed to be, `nxcompanion.app` (its
+executable inside is the one file). On Windows the build is a window app
+(`--check` attaches to the terminal it was run from); on Linux, a console one.
 
 ## The packing script in detail
 

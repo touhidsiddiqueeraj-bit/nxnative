@@ -490,8 +490,9 @@ class FrozenMode(unittest.TestCase):
 
 
 class PayloadMode(unittest.TestCase):
-    """The engine a standalone build carries beside its executable: where payload.zip is found, how
-    it unpacks (once, modes and all), and what the machine is told when it is not there."""
+    """The engine a standalone build carries inside itself: where payload.zip is found (inside the
+    executable, at sys._MEIPASS, where --add-data put it), how it unpacks (once, modes and all), and
+    what the machine is told when it is not there."""
 
     def setUp(self): self.pc = load_pc()
 
@@ -515,25 +516,25 @@ class PayloadMode(unittest.TestCase):
         enter = [p.__enter__() for p in patches]
         self.addCleanup(lambda: [p.__exit__(None, None, None) for p in reversed(patches)])
 
-    def test_payload_zip_is_found_beside_the_executable(self):
+    def test_payload_zip_is_found_inside_the_executable(self):
         with tempfile.TemporaryDirectory() as tmp:
+            inside = Path(tmp) / 'unpacked-self'; inside.mkdir()   # what sys._MEIPASS is: the app's one unpacking
+            (inside / 'payload.zip').write_bytes(b'zip-inside')
             exe = Path(tmp) / 'nxcompanion' / 'nxcompanion.exe'
             exe.parent.mkdir(parents=True); exe.write_bytes(b'')
-            for where in ('_internal', '.'):
-                (exe.parent / where).mkdir(exist_ok=True); (exe.parent / where / 'payload.zip').write_bytes(b'zip')
-            mac = Path(tmp) / 'nxcompanion.app' / 'Contents' / 'MacOS' / 'nxcompanion'
-            mac.parent.mkdir(parents=True); mac.write_bytes(b'')
-            (mac.parent.parent / 'Resources').mkdir(); (mac.parent.parent / 'Resources' / 'payload.zip').write_bytes(b'zip')
+            (exe.parent / 'payload.zip').write_bytes(b'zip-beside')   # dropped there by hand
             self.frozen()
-            with unittest.mock.patch.object(sys, 'executable', str(exe)):
-                self.assertEqual(self.pc.payload_zip(), exe.parent / '_internal' / 'payload.zip')   # the folder build's own place first
-            (exe.parent / '_internal' / 'payload.zip').unlink()
-            with unittest.mock.patch.object(sys, 'executable', str(exe)):
-                self.assertEqual(self.pc.payload_zip(), exe.parent / 'payload.zip')
+            with unittest.mock.patch.object(sys, '_MEIPASS', str(inside), create=True), \
+                 unittest.mock.patch.object(sys, 'executable', str(exe)):
+                self.assertEqual(self.pc.payload_zip(), inside / 'payload.zip')   # the one-file build's own place first
+            (inside / 'payload.zip').unlink()
+            with unittest.mock.patch.object(sys, '_MEIPASS', str(inside), create=True), \
+                 unittest.mock.patch.object(sys, 'executable', str(exe)):
+                self.assertEqual(self.pc.payload_zip(), exe.parent / 'payload.zip')   # ...or one dropped beside it
                 (exe.parent / 'payload.zip').unlink()
-                self.assertIsNone(self.pc.payload_zip())   # nothing else beside it
-            with unittest.mock.patch.object(sys, 'executable', str(mac)):
-                self.assertEqual(self.pc.payload_zip(), mac.parent.parent / 'Resources' / 'payload.zip')   # the Mac app
+                self.assertIsNone(self.pc.payload_zip())   # a broken build carries no engine at all
+            with unittest.mock.patch.object(sys, 'executable', str(exe)):   # no _MEIPASS: not a one-file build
+                self.assertIsNone(self.pc.payload_zip())
 
     def test_the_payload_unpacks_once_with_its_modes(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -638,6 +639,13 @@ class FreezeLists(unittest.TestCase):
     def test_the_mac_build_is_universal(self):
         src = (REPO / 'dm/android/tools/freeze.py').read_text()
         self.assertIn('universal2', src)   # the repository's own translator binaries are; the build matches
+
+    def test_the_build_is_one_file_with_the_engine_inside(self):
+        src = (REPO / 'dm/android/tools/freeze.py').read_text()
+        self.assertIn("'--onefile'", src)   # a single file to download, not a folder to keep together
+        self.assertIn("'--add-data'", src)   # the engine rides inside the executable (no payload beside it)
+        self.assertIn("PAYLOAD_NAME = 'payload.zip'", src)   # ...at sys._MEIPASS/payload.zip once it runs
+        self.assertNotIn("'_internal'", src)   # nothing anywhere expects a folder build anymore
 
     def test_the_payload_is_the_tree_with_its_modes(self):
         files = {p: m for m, p in self.fz.payload_files()}   # the path is the key: one mode per file

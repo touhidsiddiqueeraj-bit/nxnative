@@ -1,16 +1,20 @@
-# nxnative's PC companion as one standalone app per platform: the window, the whole build pipeline
-# (run_as_python) and the build engine itself (payload.zip beside the executable: every file git
-# tracks, unpacked once into ~/.nxcompanion/repo/<version> on the user's machine) - so a user needs
-# no Python of their own for the window and no checkout of the repository for the build. Windows,
-# Linux and a universal2 macOS build; dm/android/tools/freeze.py packs it. bash, make, python3,
-# dotnet, Java and the Android SDK stay outside (the companion's Toolchain window guides them in).
+# nxnative's PC companion as one standalone file per platform: the window, the whole build
+# pipeline (run_as_python), the pipeline's third-party modules and the build engine itself
+# (payload.zip, embedded in the executable via --add-data; unpacked once into
+# ~/.nxcompanion/repo/<version> on the user's machine) - so a user needs no Python of their own
+# for the window and no checkout of the repository for the build: download one file, run it.
+# Windows, Linux and a universal2 macOS build; dm/android/tools/freeze.py packs it. bash, make,
+# python3, dotnet, Java and the Android SDK stay outside (the companion's Toolchain window guides
+# them in). A onefile executable unpacks itself once at start and hands the unpacking down
+# (PyInstaller's _PYI_APPLICATION_HOME_DIR), so the dozens of helper processes a build spawns
+# start as fast as they would from a folder.
 #
 # CI (pushes and pull requests touching the involved files): the three builds plus three smoke
-# tests each - the --check report runs (and unpacks the payload it carries), a script handed to
-# the executable imports every third-party module the pipeline uses (lz4, capstone, fontTools,
+# tests each - the --check report runs (and unpacks the engine it carries inside), a script handed
+# to the executable imports every third-party module the pipeline uses (lz4, capstone, fontTools,
 # nsz, the zstd binding) and exercises a ProcessPoolExecutor, the shader split's own worker
 # mechanism (a spawn child re-runs a windowed executable; freeze_support answers it), and the
-# payload's own pipeline script runs inside the executable as python3 would run it.
+# engine's own pipeline script runs inside the executable as python3 would run it.
 #
 # CD (a tag v*): the same builds, packaged (zip on Windows, tar.gz elsewhere) and attached to the
 # GitHub release, named after the version pc_companion.py carries.
@@ -56,16 +60,16 @@ jobs:
           python-version: '3.12'   # the version the pipeline's zstd backport targets (3.14+ carries zstd itself)
       - name: The freeze toolchain
         run: python3 -m pip install pyinstaller lz4 capstone fonttools backports.zstd nsz
-      - name: "Freeze (the app: the window, the pipeline and the engine it runs on)"
+      - name: "Freeze (one file: the window, the pipeline, its modules and the engine it runs on)"
         run: python3 dm/android/tools/freeze.py staging
-      - name: "Smoke: the --check report runs (and the payload it carries unpacks)"
+      - name: "Smoke: the --check report runs (and the engine it carries inside unpacks)"
         shell: bash
         run: |
           set -eu
           case "${{ runner.os }}" in
             macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
-            Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;   # a folder build: no extraction per process
-            *) EXE=staging/nxcompanion/nxcompanion ;;   # a folder build on Linux too
+            Windows) EXE=staging/nxcompanion.exe ;;   # one file now: no _internal beside it
+            *) EXE=staging/nxcompanion ;;   # one file on Linux too
           esac
           # A windowed app (Windows, the Mac) has no stdout even through a redirect - the smoke
           # reads only exit codes and files, never the app's print output. The report's own 'not
@@ -76,14 +80,14 @@ jobs:
           STAMP=$(find "$HOME/.nxcompanion/repo" -maxdepth 2 -name .payload | head -1)
           test -n "$STAMP"   # the engine really unpacked (--check does it when nothing has yet)
           echo "the build engine unpacked: $(dirname "$STAMP")"
-      - name: "Smoke: the payload's own pipeline script runs inside it"
+      - name: "Smoke: the engine's own pipeline script runs inside it"
         shell: bash
         run: |
           set -eu
           case "${{ runner.os }}" in
             macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
-            Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;
-            *) EXE=staging/nxcompanion/nxcompanion ;;
+            Windows) EXE=staging/nxcompanion.exe ;;
+            *) EXE=staging/nxcompanion ;;
           esac
           # the engine --check unpacked into ~/.nxcompanion/repo/<version>: its script must run in
           # the executable as python3 would run it (run_as_python), or every build on a user's
@@ -92,7 +96,7 @@ jobs:
           PAYLOAD_SCRIPT=$(find "$HOME/.nxcompanion/repo" -maxdepth 3 -name build_apk_from_nsp.py | head -1)
           test -n "$PAYLOAD_SCRIPT"
           "$EXE" "$PAYLOAD_SCRIPT" --help
-          echo "the payload's script ran: $PAYLOAD_SCRIPT"
+          echo "the engine's script ran: $PAYLOAD_SCRIPT"
       - name: "Smoke: the pipeline's modules and workers run inside it"
         shell: bash
         timeout-minutes: 15
@@ -100,8 +104,8 @@ jobs:
           set -eu
           case "${{ runner.os }}" in
             macOS) EXE=staging/nxcompanion.app/Contents/MacOS/nxcompanion ;;
-            Windows) EXE=staging/nxcompanion/nxcompanion.exe ;;
-            *) EXE=staging/nxcompanion/nxcompanion ;;
+            Windows) EXE=staging/nxcompanion.exe ;;
+            *) EXE=staging/nxcompanion ;;
           esac
           cat > smoke_modules.py <<'EOF'
           # every third-party module the pipeline imports at run time, imported inside the executable
@@ -146,12 +150,11 @@ jobs:
           set -eu
           V=$(python3 -c 'import re; print(re.search(r"VERSION = .([0-9.]+).", open("dm/android/tools/pc_companion.py").read()).group(1))')
           if [ "${{ runner.os }}" = Windows ]; then
-            # Git Bash's tar is GNU tar: its -a only picks a *compression* program from the suffix,
-            # and .zip maps to none - a plain tar under a zip's name came out of that. Python's
-            # zipfile writes a real zip with the same entries (nxcompanion.exe + _internal/) at
-            # the root, wherever the runner runs.
-            python3 -c "import shutil; shutil.make_archive('nxcompanion-$V-${{ matrix.name }}', 'zip', 'staging/nxcompanion')"
+            # one file now: the executable is the whole app, so the release asset is the raw .exe -
+            # download it, run it; nothing to unzip and no folder to keep together.
+            cp staging/nxcompanion.exe "nxcompanion-$V-${{ matrix.name }}.exe"
           elif [ "${{ runner.os }}" = macOS ]; then
+            # the Mac app is the one folder a Mac app is allowed to be (its executable is one file, inside it)
             tar czf "nxcompanion-$V-${{ matrix.name }}.tar.gz" -C staging nxcompanion.app
           else
             tar czf "nxcompanion-$V-${{ matrix.name }}.tar.gz" -C staging nxcompanion
@@ -163,11 +166,30 @@ jobs:
           set -eu
           # the newest GLIBC symbol any bundled library asks for: 2.39 is Ubuntu 24.04's - the
           # image the build runs on - so a binary that wants more cannot run on the LTS it was
-          # built for; --check alone would never say so (the Tcl of the window is the one that bites)
-          BAD=$(find staging/nxcompanion -name '*.so*' -print0 | xargs -0 objdump -T 2>/dev/null \
-                | grep -o 'GLIBC_2\.[0-9]*' | sort -Vu | awk -F. '$2 > 39' || true)
-          test -z "$BAD" || { echo "a bundled library needs glibc newer than Ubuntu 24.04's: $BAD"; exit 1; }
-          echo 'glibc floor OK: nothing above 2.39'
+          # built for; --check alone would never say so (the Tcl of the window is the one that
+          # bites). The one-file build carries its libraries inside the executable, so they are
+          # pulled out with PyInstaller's own reader first (the same bytes the app unpacks at start).
+          python3 - staging/nxcompanion <<'EOF'
+          import subprocess, sys, tempfile
+          from PyInstaller.archive.readers import CArchiveReader
+          exe = sys.argv[1]
+          r = CArchiveReader(exe)
+          names = [n for n, (_, _, _, _, tc) in r.toc.items() if n.endswith('.so') or '.so.' in n]
+          assert names, 'no shared libraries found inside the executable - the check looked at nothing'
+          bad = {}
+          with tempfile.TemporaryDirectory() as tmp:
+              for i, n in enumerate(names):
+                  p = f'{tmp}/{i}.so'
+                  with open(p, 'wb') as f: f.write(r.extract(n))
+                  out = subprocess.run(['objdump', '-T', p], capture_output=True, text=True).stdout
+                  for tok in (t for t in out.split() if t.startswith('GLIBC_2.')):
+                      ver = tok[len('GLIBC_2.'):].rstrip(')')
+                      if ver.isdigit() and int(ver) > 39:
+                          bad.setdefault(f'GLIBC_2.{ver}', []).append(n)
+          if bad:
+              print(f'a bundled library needs glibc newer than Ubuntu 24.04\'s 2.39: {bad}'); sys.exit(1)
+          print(f'glibc floor OK: nothing above 2.39 in {len(names)} shared libraries inside {exe}')
+          EOF
       - uses: actions/upload-artifact@v4
         with:
           name: nxcompanion-${{ matrix.name }}

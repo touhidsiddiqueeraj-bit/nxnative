@@ -13,10 +13,10 @@ the build's stages stream to it live (adb forward onto the app's localabstract:n
 player watches the game arrive on the phone they will play it on. It is the screen's content, never
 a step the build waits on: pull the cable mid-build and everything on the computer still finishes.
 
-A standalone build (the Releases page; dm/android/tools/freeze.py) is one app that needs nothing
-else of the project: it carries the whole build engine as payload.zip beside the executable (every
-file git tracks, but the docs and the CI workflows), unpacks it once into ~/.nxcompanion/repo/<version>
-and runs the pipeline from there. --repo still points it at a checkout instead, for development.
+A standalone build (the Releases page; dm/android/tools/freeze.py) is a single file that needs nothing
+else of the project: it carries the whole build engine inside itself (payload.zip, every file git
+tracks but the docs and the CI workflows), unpacks it once into ~/.nxcompanion/repo/<version> and
+runs the pipeline from there. --repo still points it at a checkout instead, for development.
 What every build wants from the machine itself - Java, the Android SDK, .NET, bash, make, python3,
 zstd - the Toolchain page checks and guides in. Windows: the window runs by itself; the build steps
 want bash, make and python3 (MSYS2 provides them, or the whole build inside WSL2), and adb sees a
@@ -46,9 +46,9 @@ from pathlib import Path
 
 FROZEN = hasattr(sys, 'frozen')   # a standalone build (dm/android/tools/freeze.py): this file is the app, not a checkout
 REPO = Path.cwd() if FROZEN else Path(__file__).resolve().parents[3]
-   # from source: the checkout this file lives in; a standalone build carries its own copy of the
-   # repository instead (the payload: payload.zip beside the executable, unpacked into
-   # ~/.nxcompanion/repo/<version> on first use - see ensure_payload - and found by repo_dir)
+   # from source: the checkout this file lives in; a standalone build is one file that carries its
+   # own copy of the repository instead (the payload: payload.zip inside the executable, unpacked
+   # into ~/.nxcompanion/repo/<version> on first use - see ensure_payload - and found by repo_dir)
 VERSION = '1.1.0'   # the standalone builds' version (freeze.py names the releases after it)
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if (sys.platform == 'win32' and FROZEN) else 0
    # the standalone Windows build is a window app: without the flag every console child it spawns
@@ -117,15 +117,15 @@ def _is_repo_dir(p):
 # ---- The payload: the repository a standalone build carries inside itself ----
 
 def payload_zip():
-    """The zip a standalone build unpacked its repository from: beside the executable (a folder
-    build keeps it in _internal, the Mac app in Resources). None when this is no such build or
-    the file went missing - the toolchain report says which, and ensure_payload says it again."""
+    """The zip a standalone build unpacked its repository from: inside the executable (a one-file
+    build unpacks itself into a private temporary folder on start, and the payload rides there,
+    at sys._MEIPASS) - or one dropped beside the executable by hand. None when this is no such
+    build or neither is there - the toolchain report says which, and ensure_payload says it again."""
     if not FROZEN: return None
-    exe = Path(sys.executable).resolve()
-    for cand in (exe.parent / '_internal' / 'payload.zip',   # the folder build's own place
-                 exe.parent / 'payload.zip',                  # dropped there by hand
-                 exe.parent.parent / 'Resources' / 'payload.zip'):   # the Mac app's Contents/Resources
-        if cand.is_file(): return cand
+    inside = Path(getattr(sys, '_MEIPASS', '') or '') / 'payload.zip'   # where --add-data put it
+    if inside.is_file(): return inside
+    beside = Path(sys.executable).resolve().parent / 'payload.zip'   # dropped there by hand
+    if beside.is_file(): return beside
     return None
 
 
@@ -152,7 +152,7 @@ def ensure_payload(progress=None):
     if payload_ready(): return home
     pz = payload_zip()
     if not pz:
-        raise RuntimeError('this build carries no build engine (payload.zip is missing beside the executable):'
+        raise RuntimeError('this build carries no build engine (payload.zip is missing inside the executable):'
                            ' re-download the app')
     with _PAYLOAD_LOCK:
         if payload_ready(): return home   # a concurrent unpack finished first
@@ -254,8 +254,8 @@ def tool_report(cfg, which=shutil.which):
     rows = []
     repo = repo_dir(cfg)
     if FROZEN:
-        # the engine a standalone build carries: bundled (payload.zip beside the executable) and
-        # unpacked on first use - or, dropped into a checkout, that checkout instead
+        # the engine a standalone build carries inside itself: bundled (payload.zip, embedded in
+        # the executable) and unpacked on first use - or, dropped into a checkout, that checkout instead
         if payload_zip():
             rows.append({'name': 'the build engine', 'ok': True,
                          'detail': f'unpacked at {payload_home()}' if payload_ready() else
@@ -265,7 +265,7 @@ def tool_report(cfg, which=shutil.which):
             rows.append({'name': 'the build engine', 'ok': _is_repo_dir(repo),
                          'detail': f'the checkout at {repo}' if _is_repo_dir(repo) else 'missing',
                          'fix': None if _is_repo_dir(repo) else
-                                'this build is incomplete (no payload.zip beside the executable): re-download the app, '
+                                'this build is incomplete (no payload.zip inside the executable): re-download the app, '
                                 'or run it inside a checkout',
                          'fix_cmd': None})
     else:
@@ -712,6 +712,7 @@ def run_gui(argv):
             self.link = None; self.link_serial = None; self.events = queue.Queue()   # the phone's receiver screen
             self.unpacking = False
             fam = tkfont.nametofont('TkDefaultFont').actual('family')
+            self.fam = fam   # the setup dialog's rows want the same family
             F_TITLE, F_STEP, F_BIG = (fam, 15, 'bold'), (fam, 10, 'bold'), (fam, 11, 'bold')
 
             body = tk.Frame(self, bg=SURFACE); body.pack(fill='both', expand=True)
@@ -999,18 +1000,28 @@ def run_gui(argv):
         # -- the setup window: the guided list, each miss with its fix and an Install button where one click can do it --
         def open_setup(self):
             win = tk.Toplevel(self); win.title('Toolchain'); win.transient(self)
-            win.geometry('720x440')
-            body = ttk.Frame(win, padding=10); body.pack(fill='both', expand=True)
-            text = ScrolledText(body, height=16, wrap='word'); text.pack(fill='both', expand=True)
-            text.tag_configure('ok', foreground='#282'); text.tag_configure('miss', foreground='#c22')
+            win.geometry('720x480'); win.configure(bg=SURFACE)
+            body = tk.Frame(win, bg=SURFACE); body.pack(fill='both', expand=True, padx=14, pady=14)
+            # the report as a card, the same surface the window's own cards sit on: one row a piece,
+            # the fix under its miss (dim), so the page reads as a list, not a terminal
+            text = ScrolledText(body, wrap='word', bg=CARD, fg=INK, relief='flat', bd=0, padx=14, pady=10,
+                                highlightthickness=1, highlightbackground=LINE, font=(self.fam, 10),
+                                insertbackground=INK, selectbackground='#cdd8f3')
+            text.pack(fill='both', expand=True)
+            text.tag_configure('ok', foreground=OK)
+            text.tag_configure('miss', foreground=ERR)
+            text.tag_configure('fix', foreground=DIM)
+            text.tag_configure('dim', foreground=DIM)
             def render(rows):
                 text['state'] = 'normal'; text.delete('1.0', 'end')
                 for r in rows:
-                    text.insert('end', f"{'[ok] ' if r['ok'] else '[MISS] '} {r['name']} - {r['detail']}\n", 'ok' if r['ok'] else 'miss')
-                    if not r['ok'] and r['fix']: text.insert('end', f'       fix: {r["fix"]}\n', 'miss')
+                    text.insert('end', '\u2713 ' if r['ok'] else '\u2717 ', 'ok' if r['ok'] else 'miss')
+                    text.insert('end', f"{r['name']}  ", ('ok' if r['ok'] else 'miss'))
+                    text.insert('end', f"{r['detail']}\n", 'dim')
+                    if not r['ok'] and r['fix']: text.insert('end', f'       fix: {r["fix"]}\n', 'fix')
                 text['state'] = 'disabled'
             rows = tool_report(cfg); render(rows)
-            bar = ttk.Frame(body); bar.pack(fill='x', pady=(6, 0))
+            bar = tk.Frame(body, bg=SURFACE); bar.pack(fill='x', pady=(10, 0))
             def run_fix():
                 nonlocal rows
                 sel = [r for r in rows if not r['ok'] and r['fix_cmd']]
@@ -1021,7 +1032,8 @@ def run_gui(argv):
             ttk.Button(bar, text='Install the first missing piece', command=run_fix).pack(side='left')
             ttk.Button(bar, text='Check again', command=lambda: (setattr(self, 'setup_rows', tool_report(cfg)), render(self.setup_rows), self.refresh_tools())).pack(side='left', padx=6)
             ttk.Button(bar, text='SDK path\u2026', command=self.pick_sdk).pack(side='left')
-            ttk.Label(bar, text='Windows: the window runs by itself; the build steps want bash, make and python3 (MSYS2\nprovides them, or the whole build inside WSL2), and adb needs the phone attached with usbipd-win', justify='left').pack(side='right')
+            tk.Label(bar, text='Windows: the window runs by itself; the build steps want bash, make and python3\n(MSYS2 provides them, or the whole build inside WSL2), and adb needs the phone attached with usbipd-win',
+                     bg=SURFACE, fg=DIM, justify='right').pack(side='right', padx=(10, 0))
 
         # -- the build --
         def start(self):

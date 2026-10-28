@@ -1,30 +1,32 @@
 #!/usr/bin/env python3
-"""Freeze the PC companion into one standalone app (dm/android/tools/pc_companion.py): the window,
-the toolchain guidance, the phone link over USB - and the build pipeline itself, which a standalone
-companion runs inside its own Python: every helper the pipeline spawns is [the executable,
-<script.py>, ...], exactly the shape it used for python3 (run_as_python), and the third-party modules
-those scripts import - lz4 (block and frame), capstone, fontTools, the zstd binding, nsz - are
-carried inside the file. The shader split's ProcessPoolExecutor works too: freeze_support() in
-pc_companion.py runs the spawn children. What stays outside is what the Toolchain window guides in:
-bash, make, python3, zstd, dotnet, Java and the Android SDK.
+"""Freeze the PC companion into a single standalone file (dm/android/tools/pc_companion.py): the
+window, the toolchain guidance, the phone link over USB, the pipeline and the build engine itself,
+all inside the one executable. Every helper the pipeline spawns is [the executable, <script.py>,
+...], exactly the shape it used for python3 (run_as_python), and the third-party modules those
+scripts import - lz4 (block and frame), capstone, fontTools, the zstd binding, nsz - are carried
+inside the file too. The shader split's ProcessPoolExecutor works as well: freeze_support() in
+pc_companion.py runs the spawn children.
 
-The app needs no repository of its own: payload.zip, placed beside the executable, holds every file
-git tracks (docs and the CI workflows stay out) with git's modes - gradlew and the Mac translator
-binaries keep their execute bit even when frozen on a Windows runner, which cannot keep one on disk.
-The app unpacks it once into ~/.nxcompanion/repo/<version> (ensure_payload) and runs the pipeline
-from there. It sits inside the build, never inside the PyInstaller bundle: onedir children start
-instantly, and a --add-data copy would re-extract on every one of the dozens of processes a build
-spawns.
+One file, not one folder: a onefile executable unpacks itself into a private temporary folder when
+it starts, and hands that folder down to every child it spawns (PyInstaller sets _PYI_APPLICATION_HOME_DIR,
+and a child of the same executable that inherits it reuses the parent's unpacked copy instead of
+unpacking itself again). The old reason not to - a Defender-scanned unpack per worker, minutes
+each on the shader split's dozens of children - is gone: the app pays one unpack at start, and
+every child starts as fast as a folder build's did. The engine rides in the same place: payload.zip
+--add-data puts it inside the executable, at sys._MEIPASS/payload.zip after the one unpack, and
+the app unpacks it into ~/.nxcompanion/repo/<version> on first use (ensure_payload). What stays
+outside is what the Toolchain window guides in: bash, make, python3, zstd, dotnet, Java and the
+Android SDK.
 
 Usage:  python3 dm/android/tools/freeze.py [output dir]        (dist/ under the repository by default)
 Needs:  python3 -m pip install pyinstaller lz4 capstone fonttools backports.zstd nsz
        (Python 3.14+ carries zstd itself; freeze with 3.12 for the backport, as the releases do)
 The Mac build is universal2 (the python.org interpreter is, and so are the repository's own
 translator binaries): the wheel-makers' thin native modules - lz4, the zstd backport - get their
-other arch lipo'd in first (fatten, from the PyPI wheel of the other arch). Every platform builds
-as a folder (onedir: nxcompanion + _internal on Linux and Windows, the .app's own bundle on the
-Mac); the Windows build is a window app (--check attaches to the terminal it was run from), the
-Linux build a console one.
+other arch lipo'd in first (fatten, from the PyPI wheel of the other arch). The Windows build is
+a window app (--check attaches to the terminal it was run from), the Linux build a console one;
+the executable is the single file to keep (nxcompanion.exe, nxcompanion - the Mac's sits inside
+nxcompanion.app, the one folder a Mac app is allowed to be).
 """
 import os
 import platform
@@ -45,6 +47,7 @@ COLLECT = ['capstone', 'fontTools', 'nsz'] + ([] if sys.version_info >= (3, 14) 
 # The payload the app unpacks: everything git tracks, minus what no build ever reads (docs are for
 # people, the workflows are for GitHub) - the repository the pipeline would run in, complete.
 PAYLOAD_SKIP = ('docs/', '.github/')
+PAYLOAD_NAME = 'payload.zip'   # inside the executable (--add-data), at sys._MEIPASS/<name> once it runs
 
 
 def pyinstaller():
@@ -149,20 +152,18 @@ def main(argv):
     # terminal it was run from, see _attach_console); on Linux a console app, so --check prints
     # from a terminal and the window opens from the file manager just the same.
     windowed = sys.platform in ('win32', 'darwin') and not console
-    # A folder everywhere (onedir: the executable plus _internal beside it; on the Mac PyInstaller
-    # wraps the same layout into the .app's own bundle): a onefile child re-extracts the whole
-    # executable for every process it starts, and Defender's real-time scan makes that minutes per
-    # worker on Windows (the shader split starts dozens of them) - a folder starts every process
-    # instantly, and payload.zip rides inside it, where the app finds it beside itself.
-    onefile = False
+    # The payload first: it is an input to the freeze, not something to place beside the result
+    # (--add-data embeds it in the executable; a onefile child inherits the one unpacking anyway).
+    work = REPO / 'build' / 'nxcompanion'
+    payload = build_payload(work / PAYLOAD_NAME)
     universal = False
     if sys.platform == 'darwin':
         universal = fatten()   # the wheel-makers' thin native modules get their other arch
         if not universal: sys.exit('the universal2 Mac build needs every native module fat (see fatten above)')
     cmd = [sys.executable, '-m', 'PyInstaller', '--noconfirm', '--clean',
-           '--name', NAME, '--distpath', str(out), '--workpath', str(REPO / 'build' / 'nxcompanion'),
-           '--specpath', str(REPO / 'build' / 'nxcompanion'),
-           *( ['--onefile'] if onefile else [] ),
+           '--name', NAME, '--distpath', str(out), '--workpath', str(work), '--specpath', str(work),
+           '--onefile',   # the single file: the app unpacks itself once and its children reuse it
+           '--add-data', f'{payload}{os.pathsep}.',   # the engine, inside the executable: sys._MEIPASS/payload.zip
            *( ['--windowed'] if windowed else [] ),
            *( ['--target-architecture', 'universal2'] if universal else [] ),
            *(a for h in HIDDEN for a in ('--hidden-import', h)),
@@ -173,15 +174,10 @@ def main(argv):
     if r.returncode: sys.exit(r.returncode)
     app = out / f'{NAME}.app'
     exe = app / 'Contents' / 'MacOS' / NAME if sys.platform == 'darwin' else \
-        out / NAME / (NAME + ('.exe' if os.name == 'nt' else ''))
-    got = app if sys.platform == 'darwin' else exe
-    if not got.exists(): sys.exit(f'no output at {got}')
-    # the payload beside the executable: the .app keeps it in Resources, the folder builds in _internal
-    side = (app / 'Contents' / 'Resources' / 'payload.zip') if sys.platform == 'darwin' else \
-        exe.parent / '_internal' / 'payload.zip'
-    build_payload(side)
-    print(f'{got} ({sum(p.stat().st_size for p in got.parent.rglob("*") if p.is_file()) / 2**20:.1f} MB with the payload)'
-          f' - PyInstaller {version}, Python {sys.version.split()[0]}')
+        out / (NAME + ('.exe' if os.name == 'nt' else ''))
+    if not exe.exists(): sys.exit(f'no output at {exe}')
+    inside = exe.stat().st_size / 2**20
+    print(f'{exe} ({inside:.1f} MB, one file, engine inside) - PyInstaller {version}, Python {sys.version.split()[0]}')
     if sys.platform != 'darwin': print('smoke test: run it with --check')
     return 0
 
