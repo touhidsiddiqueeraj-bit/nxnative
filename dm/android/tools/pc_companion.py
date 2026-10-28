@@ -51,6 +51,16 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if (sys.platform == 'win3
    # the standalone Windows build is a window app: without the flag every console child it spawns
    # (adb, java, gradlew, ...) flashes its own console window; the output flows through the pipes as before
 CONFIG_DIR = Path(os.environ.get('NXC_HOME') or Path.home() / '.nxcompanion')
+
+
+def _trace(msg):
+    """A frozen child's startup steps, on record when NXC_TRACE names a file: a windowed child prints
+    nowhere, so the diagnosis of a spawn handshake that never completes runs on these lines."""
+    t = os.environ.get('NXC_TRACE')
+    if t:
+        try:
+            with open(t, 'a', encoding='utf-8') as f: f.write(f'{time.time():.1f} pid {os.getpid()}: {msg}\n')
+        except OSError: pass
 NDK_VERSION, CMAKE_VERSION, PLATFORM, BT_MIN = '26.3.11579264', '3.22.1', 'android-34', 35 * 10000   # what dm/android builds with (build.gradle.kts); BT_MIN: build-tools 35.0.0, the first whose zipalign knows -P 16
 LANGUAGES = ['en-US', 'ja', 'fr', 'de', 'es', 'zh-Hans', 'zh-Hant', 'ko', 'it', 'pt-BR', 'ru']   # -l takes any code; these are the common ones
 SDK_STEPS = ('https://developer.android.com/studio#command-line-tools-only: download the "Command line tools only" zip, '
@@ -489,6 +499,7 @@ def run_as_python(script, args):
     is the pipeline's interpreter: every helper the pipeline spawns is [this executable, <script.py>,
     ...] - the same shape it used for python itself - and this runs it with the script's folder
     first on sys.path, its own sys.argv, and __name__ == '__main__'."""
+    _trace(f'run_as_python {script}')
     if sys.stdout is None:   # a windowed build carries no stdout of its own; when the parent gave the
         # process one (a pipe), fd 1 is still there to take over, and the pipeline's events flow through it
         try: sys.stdout = open(1, 'w', encoding='utf-8', errors='replace', closefd=False)
@@ -922,9 +933,12 @@ def run_gui(argv):
 
 
 def main(argv):
+    _trace('main entered')
     if FROZEN:
         import multiprocessing
+        _trace('calling freeze_support')
         multiprocessing.freeze_support()   # a shader-split worker (ProcessPoolExecutor) re-runs this executable as a spawn child on Windows and the Mac; this runs the child instead of the window
+        _trace('freeze_support returned (not a spawn child)')
     if argv and argv[0].endswith('.py') and Path(argv[0]).is_file():
         return run_as_python(argv[0], argv[1:])   # the pipeline's helper scripts: run them as python3 would
     ap = argparse.ArgumentParser(prog='pc_companion', description='pick the NSPs and prod.keys, get an installed game on the phone (dm/android/tools/pc_companion.py)')
@@ -938,4 +952,5 @@ def main(argv):
 
 
 if __name__ == '__main__':
+    _trace('the module is __main__')
     sys.exit(main(sys.argv[1:]))
