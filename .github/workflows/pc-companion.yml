@@ -87,7 +87,7 @@ jobs:
           echo 'smoke: modules...'
           "$EXE" smoke_modules.py
           cat smoke-modules.txt
-          echo 'smoke: the spawn pool (the shader split\'s worker mechanism)...'
+          echo "smoke: the spawn pool (the shader split's worker mechanism)..."
           cat > smoke_pool.py <<'EOF'
           # a spawn child re-runs a windowed executable; freeze_support must answer it
           import multiprocessing
