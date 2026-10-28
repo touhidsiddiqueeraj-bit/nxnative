@@ -961,8 +961,25 @@ def main(argv):
                 new_handle = mp_context.reduction.duplicate(kwds['pipe_handle'], source_process=source_process)
                 _trace('wrapping the handle as a file descriptor')
                 fd = msvcrt.open_osfhandle(new_handle, os.O_RDONLY)
-                _trace('reading the pickled process and running it')
-                exitcode = mp_spawn._main(fd, source_process)
+                # the two loads _main does, one trace line each: the preparation data says how the
+                # child is meant to rebuild __main__ (the parent's path, or a module name), and the
+                # process object is what unpickles the target function out of that __main__
+                from multiprocessing import process as mp_process
+                with os.fdopen(fd, 'rb', closefd=True) as from_parent:
+                    mp_process.current_process()._inheriting = True
+                    try:
+                        preparation_data = mp_context.reduction.pickle.load(from_parent)
+                        _trace('prep: ' + repr({k: v for k, v in preparation_data.items()
+                                                 if k in ('init_main_from_name', 'init_main_from_path', 'sys_argv', 'dir', 'name')}))
+                        mp_spawn.prepare(preparation_data)
+                        m = sys.modules['__main__']
+                        _trace(f'after prepare: __main__ file={getattr(m, "__file__", None)} '
+                               f'spec={getattr(m, "__spec__", None)} has_work={hasattr(m, "work")} has_twice={hasattr(m, "twice")}')
+                        self = mp_context.reduction.pickle.load(from_parent)
+                        _trace('the process object unpickled')
+                    finally:
+                        del mp_process.current_process()._inheriting
+                exitcode = self._bootstrap(source_process)
                 _trace(f'the worker ran, exitcode {exitcode}')
                 sys.exit(exitcode or 0)
             except SystemExit:
