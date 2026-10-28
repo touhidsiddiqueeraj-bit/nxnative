@@ -34,6 +34,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ matrix.name }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -66,6 +67,7 @@ jobs:
           echo "--check exited $rc (0 ready, 1 not ready on a bare runner)"
       - name: "Smoke: the pipeline's modules and workers run inside it"
         shell: bash
+        timeout-minutes: 15
         run: |
           set -eu
           case "${{ runner.os }}" in
@@ -82,19 +84,33 @@ jobs:
           zstd.ZstdDecompressor().decompress(zstd.ZstdCompressor().compress(b'zstd inside'))   # shader_split's own call
           open('smoke-modules.txt', 'w').write('modules ok')
           EOF
+          echo 'smoke: modules...'
           "$EXE" smoke_modules.py
           cat smoke-modules.txt
+          echo 'smoke: the spawn pool (the shader split\'s worker mechanism)...'
           cat > smoke_pool.py <<'EOF'
-          # the shader split's worker mechanism: a spawn child re-runs a windowed executable
+          # a spawn child re-runs a windowed executable; freeze_support must answer it
           import multiprocessing
           from concurrent.futures import ProcessPoolExecutor
           def twice(x): return x * 2
           if __name__ == '__main__':
+              open('smoke-pool.txt', 'w').write('start method: ' + multiprocessing.get_start_method() + '\n')
               multiprocessing.set_start_method('spawn', force=True)
-              with ProcessPoolExecutor(2) as ex:
-                  open('smoke-pool.txt', 'w').write(repr(sorted(ex.map(twice, [1, 2, 3]))))
+              with ProcessPoolExecutor(1) as ex:
+                  open('smoke-pool.txt', 'a').write(repr(sorted(ex.map(twice, [1, 2, 3]))))
           EOF
-          "$EXE" smoke_pool.py
+          # a windowed child prints nowhere: watch it from outside, and on a hang show what it got to write
+          python3 - "$EXE" <<'EOF' || { echo '--- smoke-pool.txt:'; cat smoke-pool.txt 2>/dev/null || echo '(nothing: the pool never started)'; exit 1; }
+          import subprocess, sys, time
+          t0 = time.time()
+          try:
+              r = subprocess.run([sys.argv[1], 'smoke_pool.py'], capture_output=True, timeout=600)
+          except subprocess.TimeoutExpired:
+              print(f'still running after {time.time()-t0:.0f}s'); sys.exit(1)
+          print(f'pool smoke exit {r.returncode} after {time.time()-t0:.0f}s')
+          sys.exit(r.returncode or 0)
+          EOF
+          cat smoke-pool.txt
           grep -F '[2, 4, 6]' smoke-pool.txt
       - name: Package
         shell: bash
