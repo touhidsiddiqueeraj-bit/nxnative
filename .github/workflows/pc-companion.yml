@@ -49,9 +49,9 @@ jobs:
           python-version: '3.12'   # the version the pipeline's zstd backport targets (3.14+ carries zstd itself)
       - name: The freeze toolchain
         run: python3 -m pip install pyinstaller lz4 capstone fonttools backports.zstd nsz
-      - name: Freeze (one executable: the window and the pipeline)
+      - name: "Freeze (one executable: the window and the pipeline)"
         run: python3 dm/android/tools/freeze.py staging
-      - name: Smoke: the --check report runs
+      - name: "Smoke: the --check report runs"
         shell: bash
         run: |
           set -eu
@@ -64,7 +64,7 @@ jobs:
           # exit 1 is the report's own 'not ready' on a bare runner; anything else is a crash
           [ "$rc" -le 1 ] || exit "$rc"
           echo "--check exited $rc (0 ready, 1 not ready on a bare runner)"
-      - name: Smoke: the pipeline's modules and workers run inside it
+      - name: "Smoke: the pipeline's modules and workers run inside it"
         shell: bash
         run: |
           set -eu
