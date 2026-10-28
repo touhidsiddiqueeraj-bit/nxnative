@@ -96,12 +96,14 @@ def fatten():
 
 
 def main(argv):
+    console = '--console' in argv   # a debugging variant: no --windowed, so a console sits behind the window
+    argv = [a for a in argv if a != '--console']
     out = Path(argv[0]).resolve() if argv else REPO / 'dist'
     version = pyinstaller()
     # A window app on Windows and the Mac (no console behind the window; --check attaches to the
     # terminal it was run from, see _attach_console); on Linux a console app, so --check prints
     # from a terminal and the window opens from the file manager just the same.
-    windowed = sys.platform in ('win32', 'darwin')
+    windowed = sys.platform in ('win32', 'darwin') and not console
     universal = False
     if sys.platform == 'darwin':
         universal = fatten()   # the wheel-makers' thin native modules get their other arch

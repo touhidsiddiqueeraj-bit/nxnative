@@ -88,6 +88,10 @@ jobs:
           "$EXE" smoke_modules.py
           cat smoke-modules.txt
           echo "smoke: the spawn pool (the shader split's worker mechanism)..."
+          if [ "${{ runner.os }}" = Windows ]; then
+            echo 'smoke: the pool runs in the diagnosis step below on Windows'
+            exit 0
+          fi
           cat > smoke_pool.py <<'EOF'
           # a spawn child re-runs a windowed executable; freeze_support must answer it
           import multiprocessing
@@ -127,6 +131,54 @@ jobs:
           fi
           cd ..
           ls -lh nxcompanion-*
+      - name: Diagnose a Windows hang in the spawn children
+        if: runner.os == 'Windows'
+        shell: bash
+        timeout-minutes: 12
+        run: |
+          set -eu
+          mkdir -p diag
+          # one console variant (a console sits behind the window) beside the windowed one: which of
+          # the two hangs tells whether the windowed bootloader is the cause
+          python3 dm/android/tools/freeze.py --console diag-staging >/dev/null 2>&1 || { echo 'the console freeze failed'; exit 0; }
+          cat > diag_probe.py <<'EOF'
+          # breadcrumbs everywhere: a windowed child prints nowhere, but it can write files
+          import multiprocessing, os, sys, time
+          def note(s): open('diag/probe.txt', 'a').write(f'{time.time():.1f} pid {os.getpid()}: {s}\n')
+          def work(x): note('the worker ran'); return x * 2
+          if __name__ == '__main__':
+              note(f'this is {sys.executable}, start method {multiprocessing.get_start_method()}')
+              multiprocessing.set_start_method('spawn', force=True)
+              p = multiprocessing.Process(target=work, args=(21,))
+              p.start(); p.join(60)
+              note(f'the Process exited with {p.exitcode}')
+              from concurrent.futures import ProcessPoolExecutor
+              with ProcessPoolExecutor(1) as ex:
+                  note(f'the pool says {list(ex.map(work, [21]))}')
+              note('done')
+          EOF
+          for exe in staging/nxcompanion.exe diag-staging/nxcompanion.exe; do
+            echo "probing $exe..."
+            rm -f diag/probe.txt
+            python3 - "$exe" <<'EOF' || true
+            import subprocess, sys, time
+            t0 = time.time()
+            try:
+                r = subprocess.run([sys.argv[1], 'diag_probe.py'], capture_output=True, timeout=180)
+                print(f'{sys.argv[1]} exit {r.returncode} after {time.time()-t0:.0f}s')
+            except subprocess.TimeoutExpired:
+                print(f'{sys.argv[1]} STILL RUNNING after {time.time()-t0:.0f}s')
+            EOF
+            echo "--- $exe, diag/probe.txt:"; cat diag/probe.txt 2>/dev/null || echo '(nothing written)'
+          done
+          exit 0   # the diagnosis never fails the build by itself
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows'
+        with:
+          name: windows-diag
+          path: diag/
+          retention-days: 7
+          if-no-files-found: ignore
       - uses: actions/upload-artifact@v4
         with:
           name: nxcompanion-${{ matrix.name }}
