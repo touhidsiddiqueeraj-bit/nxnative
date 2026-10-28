@@ -148,7 +148,12 @@ jobs:
             rm release.keystore
           else
             # No keystore configured: the debug key signs it, so the artifact installs (CI-only;
-            # replace it with your own key for distribution)
+            # replace it with your own key for distribution). A release-only runner has never run a
+            # debug build, so the debug keystore Gradle otherwise makes is not there yet - make it.
+            mkdir -p ~/.android
+            [ -f ~/.android/debug.keystore ] || keytool -genkeypair -keystore ~/.android/debug.keystore \
+              -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
             "$ANDROID_HOME/build-tools/35.0.0/apksigner" sign --ks ~/.android/debug.keystore \
               --ks-key-alias androiddebugkey --ks-pass pass:android --key-pass pass:android \
               --out "$OUT" "$APK"
