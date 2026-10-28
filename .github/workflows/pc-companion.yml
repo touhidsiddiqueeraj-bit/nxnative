@@ -41,7 +41,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest, name: linux-x86_64 }
+          # Linux builds on 24.04, not ubuntu-latest: the app's bundled Tcl (the window) must run on
+          # the LTS people actually have - a build off the newest image's Python carries a libtcl
+          # that wants its own brand-new glibc and dies on 24.04/Debian with a loader error, while
+          # --check (no Tcl in it) runs everywhere and so never caught it on the runner itself.
+          - { os: ubuntu-24.04, name: linux-x86_64 }
           - { os: windows-latest, name: windows-x64 }
           - { os: macos-latest, name: macos-universal2 }
     runs-on: ${{ matrix.os }}
@@ -153,6 +157,17 @@ jobs:
             tar czf "nxcompanion-$V-${{ matrix.name }}.tar.gz" -C staging nxcompanion
           fi
           ls -lh nxcompanion-*
+      - name: "The window's libraries run on the LTS floor (Linux)"
+        if: matrix.name == 'linux-x86_64'
+        run: |
+          set -eu
+          # the newest GLIBC symbol any bundled library asks for: 2.39 is Ubuntu 24.04's - the
+          # image the build runs on - so a binary that wants more cannot run on the LTS it was
+          # built for; --check alone would never say so (the Tcl of the window is the one that bites)
+          BAD=$(find staging/nxcompanion -name '*.so*' -print0 | xargs -0 objdump -T 2>/dev/null \
+                | grep -o 'GLIBC_2\.[0-9]*' | sort -Vu | awk -F. '$2 > 39' || true)
+          test -z "$BAD" || { echo "a bundled library needs glibc newer than Ubuntu 24.04's: $BAD"; exit 1; }
+          echo 'glibc floor OK: nothing above 2.39'
       - uses: actions/upload-artifact@v4
         with:
           name: nxcompanion-${{ matrix.name }}

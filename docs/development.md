@@ -100,7 +100,12 @@ build), each carrying the build-engine payload — and attaches them to the same
 releases. Each job also smokes what it froze: the `--check` report runs (and
 unpacks the payload it carries), the payload's own pipeline script runs inside
 the executable as python3 would run it, and the third-party modules and a
-spawn pool run in it too.
+spawn pool run in it too. The Linux job builds on `ubuntu-24.04`, not
+`ubuntu-latest`: the window's bundled Tcl must run on the LTS distros people
+actually have — a build off the newest image's Python carries a libtcl that
+wants its own brand-new glibc and dies on 24.04 or Debian with a loader error
+(a step asserts no bundled library asks for a GLIBC symbol above 24.04's
+2.39).
 
 ## The PC companion
 
