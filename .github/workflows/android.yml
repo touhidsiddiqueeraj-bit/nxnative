@@ -164,3 +164,4 @@ jobs:
         with:
           files: nxnative-*-android.apk
           generate_release_notes: true
+          overwrite_files: true   # a moved tag rebuilds and replaces the asset

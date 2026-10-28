@@ -118,7 +118,11 @@ jobs:
           set -eu
           V=$(python3 -c 'import re; print(re.search(r"VERSION = .([0-9.]+).", open("dm/android/tools/pc_companion.py").read()).group(1))')
           if [ "${{ runner.os }}" = Windows ]; then
-            tar -a -cf "nxcompanion-$V-${{ matrix.name }}.zip" -C staging/nxcompanion nxcompanion.exe _internal   # the folder build
+            # Git Bash's tar is GNU tar: its -a only picks a *compression* program from the suffix,
+            # and .zip maps to none - a plain tar under a zip's name came out of that. Python's
+            # zipfile writes a real zip with the same entries (nxcompanion.exe + _internal/) at
+            # the root, wherever the runner runs.
+            python3 -c "import shutil; shutil.make_archive('nxcompanion-$V-${{ matrix.name }}', 'zip', 'staging/nxcompanion')"
           elif [ "${{ runner.os }}" = macOS ]; then
             tar czf "nxcompanion-$V-${{ matrix.name }}.tar.gz" -C staging nxcompanion.app
           else
@@ -145,3 +149,4 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: artifacts/*
+          overwrite_files: true   # a moved tag rebuilds and replaces the assets
