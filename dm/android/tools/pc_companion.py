@@ -506,6 +506,21 @@ def run_as_python(script, args):
         except (OSError, ValueError): sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
     if sys.stderr is None: sys.stderr = sys.stdout
     script = str(Path(script).resolve())
+    if FROZEN:
+        # CPython never tells a frozen Windows app's spawn children where the running script lives
+        # (spawn.py: WINEXE sends no init_main_from_path), so the functions those scripts define in
+        # __main__ - the shader split's workers - cannot be unpickled in the child: it dies on
+        # "Can't get attribute 'scan_file' on __main__'. Send the script's path the way an unfrozen
+        # run does; everywhere else the real one already does, and setdefault leaves it be.
+        import multiprocessing.spawn
+        real_get_preparation_data = multiprocessing.spawn.get_preparation_data
+
+        def get_preparation_data_with_path(name):
+            d = real_get_preparation_data(name)
+            d.setdefault('init_main_from_path', script)
+            return d
+
+        multiprocessing.spawn.get_preparation_data = get_preparation_data_with_path
     sys.path.insert(0, str(Path(script).parent))
     sys.argv = [script, *args]
     try:
@@ -987,7 +1002,7 @@ def main(argv):
             except BaseException:
                 import traceback
                 _trace('the spawn handshake failed:\n' + traceback.format_exc())
-                raise
+                sys.exit(1)   # not re-raised: a windowed build's uncaught error is a modal dialog, which on a machine with nobody at it is a hang
         _trace('argv: ' + repr(sys.argv))
         _trace('calling freeze_support')
         multiprocessing.freeze_support()   # the tracker's '-c' helpers here, and the worker children on the Mac
