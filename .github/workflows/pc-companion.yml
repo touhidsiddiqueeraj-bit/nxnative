@@ -14,7 +14,10 @@
 # to the executable imports every third-party module the pipeline uses (lz4, capstone, fontTools,
 # nsz, the zstd binding) and exercises a ProcessPoolExecutor, the shader split's own worker
 # mechanism (a spawn child re-runs a windowed executable; freeze_support answers it), and the
-# engine's own pipeline script runs inside the executable as python3 would run it.
+# engine's own pipeline script runs inside the executable as python3 would run it. On Linux one
+# more: the shader chain's tool lock verifies inside the executable (dmsh_chain.py --check-tools
+# through run_as_python - the translator's dll through dotnet and the committed static spirv-cross,
+# the same check every build runs before its first shader).
 #
 # CD (a tag v*): the same builds, packaged (zip on Windows, tar.gz elsewhere) and attached to the
 # GitHub release, named after the version pc_companion.py carries.
@@ -62,6 +65,11 @@ jobs:
         run: python3 -m pip install pyinstaller lz4 capstone fonttools backports.zstd nsz
       - name: "Freeze (one file: the window, the pipeline, its modules and the engine it runs on)"
         run: python3 dm/android/tools/freeze.py staging
+      - name: The .NET runtime the shader translator runs on (Linux)
+        if: matrix.name == 'linux-x86_64'
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'   # dmsh_xlate.dll targets net10.0 (nx_extract needs the SDK; the translator only the runtime)
       - name: "Smoke: the --check report runs (and the engine it carries inside unpacks)"
         shell: bash
         run: |
@@ -97,6 +105,23 @@ jobs:
           test -n "$PAYLOAD_SCRIPT"
           "$EXE" "$PAYLOAD_SCRIPT" --help
           echo "the engine's script ran: $PAYLOAD_SCRIPT"
+      - name: "Smoke: the shader chain's tools verify inside it (Linux)"
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        timeout-minutes: 10
+        run: |
+          set -eu
+          EXE=staging/nxcompanion
+          # The engine's own tool lock, run by the executable itself (run_as_python): the translator
+          # through dotnet (the Mach-O launcher cannot run here - the dll is the same assembly, the
+          # lock's fingerprints cover it), the committed static spirv-cross (no glibc floor), and no
+          # Metal compiler on a platform whose shaders stop at SPIR-V. This is the same check every
+          # build runs before its first shader; its passing here is the Linux chain working, end to
+          # end, inside the one file a user downloads.
+          CHAIN=$(find "$HOME/.nxcompanion/repo" -maxdepth 5 -name dmsh_chain.py -path '*dm/gfx/tools*' | head -1)
+          test -n "$CHAIN"
+          "$EXE" "$CHAIN" --check-tools
+          echo "the shader chain's tools verify inside the executable: $CHAIN"
       - name: "Smoke: the pipeline's modules and workers run inside it"
         shell: bash
         timeout-minutes: 15

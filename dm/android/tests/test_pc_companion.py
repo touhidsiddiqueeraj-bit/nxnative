@@ -169,6 +169,90 @@ class Toolchain(unittest.TestCase):
             self.assertTrue(row['ok'])
 
 
+class SdkDiscovery(unittest.TestCase):
+    """The SDK a build uses is found, not typed in: the remembered path, the environment's, then the
+    usual install folders - and a distro's android-tools (adb on PATH) is not mistaken for one."""
+    def setUp(self): self.pc = load_pc()
+
+    def fake_sdk(self, tmp):
+        sdk = Path(tmp) / 'found-sdk'
+        (sdk / 'platform-tools').mkdir(parents=True)
+        return sdk
+
+    def test_a_remembered_sdk_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sdk = self.fake_sdk(tmp)
+            self.assertEqual(self.pc.find_sdk({'sdk': str(sdk)}), str(sdk))   # no discovery needed
+
+    def test_the_environment_sdk_is_found_and_remembered(self):
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': str(self.fake_sdk(tmp)), 'ANDROID_SDK_ROOT': ''}):
+            with unittest.mock.patch.object(self.pc, 'CONFIG_DIR', Path(tmp) / 'home'), \
+                 unittest.mock.patch.object(self.pc, 'save_config', lambda cfg, home=None: None):   # a test never writes the real config
+                cfg = {}
+                self.assertEqual(self.pc.find_sdk(cfg), os.environ['ANDROID_HOME'])
+                self.assertEqual(cfg['sdk'], os.environ['ANDROID_HOME'])   # remembered for the next run
+
+    def test_no_sdk_anywhere_is_an_empty_answer(self):
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': str(Path(tmp) / 'none'), 'ANDROID_SDK_ROOT': ''}):
+            with unittest.mock.patch.object(self.pc, 'sdk_candidates', lambda: [Path(tmp) / 'nothing']):
+                self.assertEqual(self.pc.find_sdk({}), '')   # the report's row says what to install
+
+    def test_a_distro_adb_folder_is_not_mistaken_for_an_sdk(self):
+        with tempfile.TemporaryDirectory() as tmp:   # android-tools puts adb in /usr/bin: no sdk root anywhere
+            self.assertFalse(self.pc.looks_like_sdk(Path(tmp)))
+            self.assertFalse(self.pc.looks_like_sdk(Path('/usr')))
+
+
+class TranslatorStatus(unittest.TestCase):
+    """The shader chain's row: the committed translator (its launcher, or the same dll through dotnet)
+    and the committed spirv-cross of the platform."""
+    def setUp(self): self.pc = load_pc()
+
+    def fake_engine(self, tmp):
+        repo = Path(tmp) / 'engine'
+        xdir = repo / 'dm/gfx/tools/dmsh_xlate_bin'
+        xdir.mkdir(parents=True)
+        for f in ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll'): (xdir / f).write_text('')
+        sdir = repo / 'dm/gfx/tools/spirv_cross_bin'; sdir.mkdir(parents=True)
+        name = 'spirv-cross' if sys.platform == 'darwin' else ('spirv-cross-linux-x86_64' if sys.platform.startswith('linux') else None)
+        if name:
+            sc = sdir / name; sc.write_text(''); sc.chmod(0o755)
+        return repo
+
+    def test_an_incomplete_engine_is_guided_not_runnable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self.pc.translator_status(Path(tmp) / 'engine', which=lambda name: '/bin/dotnet')
+            self.assertFalse(row['ok'])
+            self.assertTrue(row['fix'])   # every miss explains itself
+
+    def test_a_complete_engine_that_runs_is_ok(self):
+        if not (sys.platform == 'darwin' or sys.platform.startswith('linux')): self.skipTest('no committed spirv-cross for this platform')
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(self.pc, 'run_out', return_value=(0, '')):
+            row = self.pc.translator_status(self.fake_engine(tmp), which=lambda name: '/bin/dotnet')
+            self.assertTrue(row['ok'])
+            self.assertIn('spirv-cross', row['detail'])   # names the platform's committed build
+
+    def test_the_launcher_that_cannot_run_falls_back_to_dotnet(self):
+        if not sys.platform.startswith('linux'): self.skipTest('the fallback is the Linux shape (the Mach-O launcher)')
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.fake_engine(tmp)
+            probes = []
+            def run_out(cmd, **kw):   # the launcher fails, dotnet runs the dll
+                probes.append(cmd[0])
+                return (1, 'exec format error') if cmd[0].endswith('dmsh_xlate') else (0, 'f21af1efa737a270')
+            with unittest.mock.patch.object(self.pc, 'run_out', side_effect=run_out):
+                row = self.pc.translator_status(repo, which=lambda name: '/usr/bin/dotnet')
+                self.assertTrue(row['ok']); self.assertIn('dotnet', row['detail'])
+                self.assertEqual(len(probes), 2)   # the launcher first, the dll through dotnet second
+
+    def test_the_dll_without_dotnet_is_a_net_fix(self):
+        if not sys.platform.startswith('linux'): self.skipTest('the dotnet guidance is the Linux shape')
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.object(self.pc, 'run_out', return_value=(1, 'exec format error')):
+            row = self.pc.translator_status(self.fake_engine(tmp), which=lambda name: None)
+            self.assertFalse(row['ok'])
+            self.assertIn('.NET', row['fix'])   # guided to the runtime that runs the dll
+
+
 class Devices(unittest.TestCase):
     def setUp(self): self.pc = load_pc()
 
@@ -655,6 +739,12 @@ class FreezeLists(unittest.TestCase):
         self.assertEqual(files['dm/android/gradlew'], 0o755)     # git's +x, whatever the runner's disk did with it
         self.assertFalse(any(p.startswith('docs/') or p.startswith('.github/') for p in files))   # no build reads those
         self.assertTrue(any(p.startswith('dm/games/') for p in files))   # the game profiles ride along
+
+    def test_the_payload_carries_both_shader_tools_for_the_linux_build(self):
+        files = {p: m for m, p in self.fz.payload_files()}
+        self.assertIn('dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate.dll', files)   # the translator runs through dotnet on Linux
+        self.assertEqual(files.get('dm/gfx/tools/spirv_cross_bin/spirv-cross-linux-x86_64'), 0o755)   # committed, executable
+        self.assertEqual(files.get('dm/gfx/tools/spirv_cross_bin/spirv-cross'), 0o755)   # the Mac's universal build
 
 
 class ProgressFile(unittest.TestCase):

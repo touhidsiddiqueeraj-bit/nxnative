@@ -17,8 +17,11 @@ A standalone build (the Releases page; dm/android/tools/freeze.py) is a single f
 else of the project: it carries the whole build engine inside itself (payload.zip, every file git
 tracks but the docs and the CI workflows), unpacks it once into ~/.nxcompanion/repo/<version> and
 runs the pipeline from there. --repo still points it at a checkout instead, for development.
-What every build wants from the machine itself - Java, the Android SDK, .NET, bash, make, python3,
-zstd - the Toolchain page checks and guides in. Windows: the window runs by itself; the build steps
+The shader chain runs on the Mac and on Linux (the translator is a .NET assembly whose dll dotnet
+runs on either; the committed spirv-cross builds cover both) - on Windows the shader step is the one
+thing that does not run yet. What every build wants from the machine itself - Java, the Android SDK
+(auto-found in the usual places, or set once with --sdk), .NET, bash, make, python3, zstd - the
+Toolchain page checks and guides in. Windows: the window runs by itself; the build steps
 want bash, make and python3 (MSYS2 provides them, or the whole build inside WSL2), and adb sees a
 USB phone once usbipd-win attaches it (the toolchain page has the commands).
 
@@ -49,7 +52,7 @@ REPO = Path.cwd() if FROZEN else Path(__file__).resolve().parents[3]
    # from source: the checkout this file lives in; a standalone build is one file that carries its
    # own copy of the repository instead (the payload: payload.zip inside the executable, unpacked
    # into ~/.nxcompanion/repo/<version> on first use - see ensure_payload - and found by repo_dir)
-VERSION = '1.1.0'   # the standalone builds' version (freeze.py names the releases after it)
+VERSION = '1.2.0'   # the standalone builds' version (freeze.py names the releases after it)
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0) if (sys.platform == 'win32' and FROZEN) else 0
    # the standalone Windows build is a window app: without the flag every console child it spawns
    # (adb, java, gradlew, ...) flashes its own console window; the output flows through the pipes as before
@@ -66,8 +69,10 @@ def _trace(msg):
         except OSError: pass
 NDK_VERSION, CMAKE_VERSION, PLATFORM, BT_MIN = '26.3.11579264', '3.22.1', 'android-34', 35 * 10000   # what dm/android builds with (build.gradle.kts); BT_MIN: build-tools 35.0.0, the first whose zipalign knows -P 16
 LANGUAGES = ['en-US', 'ja', 'fr', 'de', 'es', 'zh-Hans', 'zh-Hant', 'ko', 'it', 'pt-BR', 'ru']   # -l takes any code; these are the common ones
-SDK_STEPS = ('https://developer.android.com/studio#command-line-tools-only: download the "Command line tools only" zip, '
-             'unzip it to ~/android-sdk/cmdline-tools/latest (licenses are accepted on first install), then reopen this check')
+SDK_STEPS = ('https://developer.android.com/studio#command-line-tools-only: download the "Command line tools only" zip for this system, '
+             'unzip it to ~/Android/Sdk/cmdline-tools/latest (licenses are accepted on first install), then reopen this check. '
+             'A distro package such as android-tools (Arch) or adb (Debian) carries adb only - not the SDK with the NDK, cmake, '
+             'platforms and build-tools the build also needs')
 
 # The phone's receiver screen (dm/android ReceiverActivity / ReceiverLink): the socket adb forward
 # pairs with, the activity am start raises (the namespace, not the per-game applicationId), and the
@@ -300,19 +305,89 @@ def tool_report(cfg, which=shutil.which):
     rows.append({'name': 'Java 17+', 'ok': bool(jv and jver and jver >= 17),
                  'detail': f'{jv} (version {jver})' if jv else '-',
                  'fix': None if jv and jver and jver >= 17 else 'Gradle needs Java 17+: brew install --cask temurin@17, or see adoptium.net (Windows: inside WSL)', 'fix_cmd': None})
-    rows.append(sdk_status(cfg.get('sdk') or os.environ.get('ANDROID_HOME')))
-    xlate = repo / 'dm/gfx/tools/dmsh_xlate_bin/dmsh_xlate'
-    scross = repo / 'dm/gfx/tools/spirv_cross_bin/spirv-cross'
-    both = xlate.is_file() and scross.is_file()
-    runnable = both and (sys.platform == 'darwin' or not run_out([str(xlate), '--source-sha'], timeout=30)[0])
-    rows.append({'name': 'the build engine\'s translator and spirv-cross', 'ok': runnable,
-                 'detail': ('in the engine' if both else 'missing from the engine') +
-                           ('' if runnable or not both else ' - they are macOS binaries; they cannot run here'),
-                 'fix': None if runnable else (('unpack it again (delete ' + str(payload_home()) + ') and let the app redo it'
-                                                if FROZEN and payload_zip() else 'git checkout / clone the repository again') if not both else
-                         'they are the Mac binaries the shader chain is locked to: a game\'s shader step needs a Mac today, the steps before it run here'),
-                 'fix_cmd': None})
+    sdk = find_sdk(cfg)
+    row = sdk_status(sdk)
+    if not sdk and which('adb'):
+        row['detail'] = "not found (adb is on PATH - a distro's android-tools - but that is not the SDK: the NDK, cmake, platforms and build-tools are missing too)"
+    rows.append(row)
+    rows.append(translator_status(repo, which))
     return rows
+
+
+def translator_status(repo, which=shutil.which):
+    """The shader chain's tools: the translator (its committed .NET build - the Mac launcher runs it
+    as is, anywhere else dotnet runs the same dll) and the committed spirv-cross of this platform."""
+    xdir = repo / 'dm/gfx/tools/dmsh_xlate_bin'
+    have_x = all((xdir / f).is_file() for f in ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll'))
+    sname = 'spirv-cross' if sys.platform == 'darwin' else ('spirv-cross-linux-x86_64' if sys.platform.startswith('linux') else None)
+    scross = repo / 'dm/gfx/tools/spirv_cross_bin' / (sname or 'spirv-cross')
+    have_s = scross.is_file() and os.access(scross, os.X_OK)
+    runnable, via = False, ''
+    if have_x:
+        rc, _ = run_out([str(xdir / 'dmsh_xlate'), '--source-sha'], timeout=120)
+        if not rc: runnable, via = True, 'the committed launcher'
+        elif which('dotnet'):
+            rc, _ = run_out([which('dotnet'), str(xdir / 'dmsh_xlate.dll'), '--source-sha'], timeout=120)
+            if not rc: runnable, via = True, 'the same dll through dotnet'
+    if sname is None:   # Windows today: the committed spirv-cross builds cover the Mac and Linux only
+        return {'name': 'the shader translator and spirv-cross', 'ok': False,
+                'detail': 'the shader step needs the Mac or Linux today' + ('; the translator itself runs here' if runnable else ''),
+                'fix': 'the shader translation step runs on the Mac and on Linux (the committed spirv-cross builds cover those); '
+                       'every other step of the build runs here - the APK cannot be finished on Windows yet',
+                'fix_cmd': None}
+    ok = bool(runnable and have_s)
+    detail = (f'{via}, spirv-cross ({sname})' if ok else
+              ('missing from the engine' if not (have_x and have_s) else 'not runnable here'))
+    fix = None
+    if not ok:
+        if sys.platform == 'darwin':
+            fix = ('unpack the engine again (delete ' + str(payload_home()) + ') and let the app redo it' if FROZEN else
+                    'git checkout / clone the repository again') if not (have_x and have_s) else 'it does not run - rebuild dm/gfx/tools/dmsh_xlate_bin'
+        elif not have_x or not have_s:
+            fix = ('the engine is incomplete: unpack it again (delete ' + str(payload_home()) + ') and let the app redo it' if FROZEN else
+                    'git checkout / clone the repository again (the build is incomplete)')
+        else:
+            fix = 'the .NET SDK 10 runs the translator on this platform (brew install --cask dotnet-sdk, pacman -S dotnet-sdk, or dotnet.microsoft.com/download)'
+    return {'name': 'the shader translator and spirv-cross', 'ok': ok, 'detail': detail, 'fix': fix, 'fix_cmd': None}
+
+
+# ---- The Android SDK: where it hides, and whether a folder is one ----
+
+def sdk_candidates():
+    """The places the Android SDK lives, in order: the environment's, then the usual install folders."""
+    cands = []
+    for env in ('ANDROID_HOME', 'ANDROID_SDK_ROOT'):
+        if os.environ.get(env): cands.append(Path(os.environ[env]))
+    home = Path.home()
+    if sys.platform == 'darwin': cands.append(home / 'Library' / 'Android' / 'sdk')
+    elif os.name == 'nt' and os.environ.get('LOCALAPPDATA'): cands.append(Path(os.environ['LOCALAPPDATA']) / 'Android' / 'Sdk')
+    cands += [home / 'Android' / 'Sdk', home / '.local' / 'share' / 'android-sdk',
+              Path('/opt/android-sdk'), Path('/usr/lib/android-sdk')]   # the distro conventions
+    out, seen = [], set()
+    for c in cands:
+        if str(c) not in seen: seen.add(str(c)); out.append(c)
+    return out
+
+
+def looks_like_sdk(p):
+    """A folder that plausibly is an SDK root (platform-tools alone may still miss pieces - sdk_status
+    says which); a distro's android-tools package is adb on PATH, not an SDK."""
+    p = Path(p)
+    return p.is_dir() and any((p / part).exists() for part in ('platform-tools', 'cmdline-tools', 'ndk', 'build-tools', 'platforms'))
+
+
+def find_sdk(cfg):
+    """The SDK to build with: the remembered one, else the first plausible one of the usual places
+    (ANDROID_HOME, ANDROID_SDK_ROOT, ~/Android/Sdk, the distro folders), remembered when found. An
+    empty string when there is none - the report's row then explains what to install."""
+    if cfg.get('sdk') and Path(cfg['sdk']).is_dir(): return cfg['sdk']
+    for cand in sdk_candidates():
+        if looks_like_sdk(cand):
+            cfg['sdk'] = str(cand)
+            try: save_config(cfg)
+            except OSError: pass
+            return cfg['sdk']
+    return cfg.get('sdk') or ''
 
 
 # ---- The phone over USB ----

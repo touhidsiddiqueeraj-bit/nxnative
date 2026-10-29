@@ -30,12 +30,15 @@ STAMP = 'inputs.tsv'   # in the library directory b-<V>/
 XLATE_DIR = os.path.dirname(os.environ.get('XLATE', os.path.join(HERE, 'dmsh_xlate_bin/dmsh_xlate')))
 
 
-def xlate_command(launcher, _memo={}):
+_XLATE_MEMO = {}   # the launcher → argv resolution, probed once per launcher (a subprocess run each)
+
+
+def xlate_command(launcher):
     """[argv...] that runs the translator launcher on this platform: the launcher itself when it runs
     (the committed universal Mach-O on the Mac, a custom build anywhere), otherwise the .dll beside it
     through dotnet - the same assembly on every platform, which the lock's dll fingerprints and source
     sha cover, so a Linux or Windows machine translates exactly what a Mac does."""
-    if launcher in _memo: return list(_memo[launcher])
+    if launcher in _XLATE_MEMO: return list(_XLATE_MEMO[launcher])
     try:
         if subprocess.run([launcher, '--source-sha'], capture_output=True, timeout=120).returncode == 0:
             cmd = [launcher]
@@ -47,7 +50,7 @@ def xlate_command(launcher, _memo={}):
         dot = shutil.which('dotnet')
         if dot and os.path.isfile(dll): cmd = [dot, dll]
         else: cmd = [launcher]   # nothing runs it: the caller's report says what is missing
-    _memo[launcher] = list(cmd)
+    _XLATE_MEMO[launcher] = list(cmd)
     return list(cmd)
 
 

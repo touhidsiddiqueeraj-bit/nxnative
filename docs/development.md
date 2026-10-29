@@ -152,7 +152,21 @@ per platform. What the freeze does beyond the default:
   the Toolchain page shows the engine as a row, so a broken bundle says
   "re-download" instead of failing mid-build.
 - bash, make, python3, zstd, dotnet, Java and the Android SDK stay outside:
-  the window guides their installation.
+  the window guides their installation. The SDK is found on its own when it
+  sits in a usual place (`ANDROID_HOME`, `ANDROID_SDK_ROOT`, `~/Android/Sdk`,
+  `~/.local/share/android-sdk`, `/opt/android-sdk`, `/usr/lib/android-sdk`)
+  and remembered; a distro's `android-tools` package (adb on `PATH`) is
+  recognized for what it is — not the SDK — and the row says so.
+- The shader chain runs on Linux as it does on the Mac: the translator is a
+  .NET assembly, so `dmsh_chain.xlate_command` runs the Mac's launcher where
+  it can and the same `dmsh_xlate.dll` through `dotnet` everywhere else (the
+  lock's dll fingerprints and source sha cover either way); the committed
+  `spirv-cross-linux-x86_64` — the same pinned upstream commit `build.sh`
+  builds, statically, so no glibc floor — has its own lock key, and the Metal
+  keys simply do not exist off the Mac (the APK pipeline's shaders stop at
+  SPIR-V). On Windows the translator runs the same way, but no committed
+  spirv-cross build covers it yet: the Toolchain page says the shader step
+  needs the Mac or Linux today.
 
 `freeze.py`'s module lists are checked against the pipeline's actual imports by
 `test_pc_companion.py`'s `FreezeLists` (which also checks the payload: the
@@ -396,7 +410,7 @@ To add a game:
 
 ## Build by hand (Mac)
 
-`scripts/build_ipa_from_nsp.py --platform mac` does steps 1 to 4 in the game's NSP folder and prints the command of step 5 ([A Mac-only build for development](#a-mac-only-build-for-development)). The steps by hand follow. You need the same tools as the script. The shader translator is the prebuilt `dm/gfx/tools/dmsh_xlate_bin`, the build that matches `dmsh_chain.lock`; a fresh `dotnet publish` gives different fingerprints. Its launcher `dmsh_xlate` is a universal binary (arm64 and x86_64), so an Intel Mac runs it too, with the same output; after a rebuild, join the new launcher with lipo to the one `dotnet build -r osx-x64` makes of the same .NET version (the lock does not cover the launcher). spirv-cross is the prebuilt `dm/gfx/tools/spirv_cross_bin/spirv-cross`, not the one on `PATH`: a universal binary that `build.sh` beside it builds reproducibly from a pinned SPIRV-Cross commit (the same bytes for the same Xcode), with SPIRV-Cross's licences beside it; every shader tool (the NVN chain, `vk_shaders.py`, `gl_shaders.py`) runs it, and the lock records its fingerprint ([GitHub issue #242](https://github.com/seedds/nxnative/issues/242): a Homebrew build is compiled from source on macOS versions without a bottle and never matched). What an Intel Mac cannot run is the Mac host, which runs the game's own arm64 code: the NSP script stops at a step that boots the game there (a run-time shader capture, a decode with the game's own Oodle or LZ5) and skips a provisional profile's heap check. The commands use three variables:
+`scripts/build_ipa_from_nsp.py --platform mac` does steps 1 to 4 in the game's NSP folder and prints the command of step 5 ([A Mac-only build for development](#a-mac-only-build-for-development)). The steps by hand follow. You need the same tools as the script. The shader translator is the prebuilt `dm/gfx/tools/dmsh_xlate_bin`, the build that matches `dmsh_chain.lock`; a fresh `dotnet publish` gives different fingerprints. Its launcher `dmsh_xlate` is a universal binary (arm64 and x86_64), so an Intel Mac runs it too, with the same output; after a rebuild, join the new launcher with lipo to the one `dotnet build -r osx-x64` makes of the same .NET version (the lock does not cover the launcher). spirv-cross is the prebuilt `dm/gfx/tools/spirv_cross_bin/spirv-cross`, not the one on `PATH`: a universal binary that `build.sh` beside it builds reproducibly from a pinned SPIRV-Cross commit (the same bytes for the same Xcode), with SPIRV-Cross's licences beside it; every shader tool (the NVN chain, `vk_shaders.py`, `gl_shaders.py`) runs it, and the lock records its fingerprint ([GitHub issue #242](https://github.com/seedds/nxnative/issues/242): a Homebrew build is compiled from source on macOS versions without a bottle and never matched). The same `build.sh` on Linux builds the pinned commit into `spirv-cross-linux-x86_64`, statically (a dynamic build would drag the builder's glibc floor along), under its own lock key; the Android pipeline (`build_apk_from_nsp.py`, whose shaders stop at SPIR-V) runs the whole chain there — the translator's dll through `dotnet`, that binary — which is what the PC companion's Linux build does on a player's machine. What an Intel Mac cannot run is the Mac host, which runs the game's own arm64 code: the NSP script stops at a step that boots the game there (a run-time shader capture, a decode with the game's own Oodle or LZ5) and skips a provisional profile's heap check. The commands use three variables:
 - `G`, the profile;
 - `W`, the game's work folder: `<title ID>-work` inside the game's NSP folder, outside this repository and off the home folder (it grows to the size of the game files);
 - `VER`, a version folder named after the NSP version.
