@@ -70,6 +70,9 @@ def spirv_cross_path():
     name = spirv_cross_name() or 'spirv-cross'
     return os.path.join(HERE, 'spirv_cross_bin', name)
 
+
+SPIRV_CROSS = spirv_cross_path()   # the committed build the lock records (the Mac's, or the x86_64 Linux one beside it): what the shader tools import (vk_shaders, gl_shaders, dmsh_dryrun)
+
 def options():
     return 'debug=%s reduced=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1')
 
@@ -117,7 +120,10 @@ def tools_now():
     steps are the iOS side's; an Android build's shaders stop at SPIR-V and run on Linux and in WSL too)"""
     t = {}
     for dll in ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll'): t[dll] = sha16(os.path.join(XLATE_DIR, dll))
-    t['xlate_source'] = subprocess.run(xlate_command(os.path.join(XLATE_DIR, 'dmsh_xlate')) + ['--source-sha'], capture_output=True, text=True, timeout=300).stdout.strip()
+    try:   # the launcher is another platform's binary and dotnet is not installed: a missing tool, not a crash
+        t['xlate_source'] = subprocess.run(xlate_command(os.path.join(XLATE_DIR, 'dmsh_xlate')) + ['--source-sha'], capture_output=True, text=True, timeout=300).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        t['xlate_source'] = 'missing'
     sc = shutil.which(spirv_cross_path())
     t[spirv_cross_name() or 'spirv-cross'] = sha16(sc) if sc else 'missing'
     if sys.platform == 'darwin':

@@ -139,7 +139,9 @@ class Toolchain(unittest.TestCase):
         self.assertIsNone(self.pc.java_version('no version here'))
 
     def test_report_with_nothing(self):
-        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': str(Path(tmp) / 'sdk')}):
+        # both SDK variables cleared: a runner that preinstalls the SDK (ubuntu-latest does, for the
+        # android workflow) must not leak it into the premise - the machine under test has nothing
+        with tempfile.TemporaryDirectory() as tmp, unittest.mock.patch.dict(os.environ, {'ANDROID_HOME': str(Path(tmp) / 'sdk'), 'ANDROID_SDK_ROOT': ''}):
             with unittest.mock.patch.object(self.pc.shutil, 'which', return_value=None), \
                  unittest.mock.patch.object(self.pc, '_importable', return_value=False), \
                  unittest.mock.patch.object(self.pc, 'REPO', Path(tmp)):   # a machine with no checkout: the engine row fails too
