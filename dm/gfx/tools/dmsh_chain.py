@@ -12,7 +12,7 @@
 #       dmsh_chain.py --check-tools   verify that the actual tools match the lock file; on mismatch print [RED] lines and exit 1
 #       dmsh_chain.py --update-lock   rewrite the lock file from the actual tools (run after changing Ryujinx / spirv-cross / Xcode; committed to the repo)
 # Environment: XLATE_DEBUG / XLATE_REDUCED (same meaning as in dmsh_build.py, default 1 / 1; non-default options yield a different V, which the host will not load)
-import os, sys, hashlib, subprocess, shutil
+import os, sys, hashlib, subprocess, shutil, platform
 DM_ROOT = os.environ.get('DM_ROOT') or os.path.expanduser('~/dm-work')   # Workspace root (game files, build outputs and run artifacts are all under it)
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); HOME = os.path.expanduser('~')
 FILES = ['tools/dmsh_chain.py', 'tools/dmsh_build.py', 'tools/dmsh_atomic.py', 'tools/dmsh_fetch.py', 'tools/dmsh_vin.py', 'tools/dmsh_pull.py', 'tools/dmsh_pull.metal', 'tools/dmsh_geometry.py', 'tools/dmsh_facts.py', 'tools/dmsh_xlate/Program.cs', 'tools/dmsh_xlate/dmsh_xlate.csproj', '../ios/tools/ios_metal.py', 'tools/dmsh_chain.lock']
@@ -28,8 +28,44 @@ LOCK = os.path.join(HERE, 'dmsh_chain.lock'); HEADER = os.path.join(GFX, 'nvn/dm
 STAMP = 'inputs.tsv'   # in the library directory b-<V>/
 # the translator defaults to the in-repo build that matches the lock file (a rebuilt dll has different fingerprints)
 XLATE_DIR = os.path.dirname(os.environ.get('XLATE', os.path.join(HERE, 'dmsh_xlate_bin/dmsh_xlate')))
-# spirv-cross likewise: the in-repo build (spirv_cross_bin/build.sh, a pinned upstream commit) that matches the lock file, not the one on PATH, so every Mac converts with the same build
-SPIRV_CROSS = os.environ.get('SPIRV_CROSS', os.path.join(HERE, 'spirv_cross_bin/spirv-cross'))
+
+
+def xlate_command(launcher, _memo={}):
+    """[argv...] that runs the translator launcher on this platform: the launcher itself when it runs
+    (the committed universal Mach-O on the Mac, a custom build anywhere), otherwise the .dll beside it
+    through dotnet - the same assembly on every platform, which the lock's dll fingerprints and source
+    sha cover, so a Linux or Windows machine translates exactly what a Mac does."""
+    if launcher in _memo: return list(_memo[launcher])
+    try:
+        if subprocess.run([launcher, '--source-sha'], capture_output=True, timeout=120).returncode == 0:
+            cmd = [launcher]
+        else: cmd = None
+    except (OSError, subprocess.SubprocessError):
+        cmd = None   # the launcher is another platform's binary (the Mach-O on Linux), or cannot run
+    if cmd is None:
+        dll = os.path.join(os.path.dirname(launcher) or '.', 'dmsh_xlate.dll')
+        dot = shutil.which('dotnet')
+        if dot and os.path.isfile(dll): cmd = [dot, dll]
+        else: cmd = [launcher]   # nothing runs it: the caller's report says what is missing
+    _memo[launcher] = list(cmd)
+    return list(cmd)
+
+
+def spirv_cross_name():
+    """The committed SPIRV-Cross this platform runs: the universal Mach-O on the Mac, the x86_64 Linux
+    build beside it (its own fingerprint, its own lock key); None on a platform without one (the shader
+    chain runs on the Mac and on Linux today; dmsh_build.py names what a Windows build misses)."""
+    if sys.platform == 'darwin': return 'spirv-cross'
+    if sys.platform.startswith('linux') and platform.machine() in ('x86_64', 'AMD64'): return 'spirv-cross-linux-x86_64'
+    return None
+
+
+def spirv_cross_path():
+    """The SPIRV-Cross to run: the environment's, else the committed build for this platform."""
+    env = os.environ.get('SPIRV_CROSS')
+    if env: return env
+    name = spirv_cross_name() or 'spirv-cross'
+    return os.path.join(HERE, 'spirv_cross_bin', name)
 
 def options():
     return 'debug=%s reduced=%s' % (os.environ.get('XLATE_DEBUG', '1') != '0', os.environ.get('XLATE_REDUCED', '1') == '1')
@@ -72,15 +108,19 @@ def table_head(lib):   # the header c1_full.tsv / cb_extent.tsv start with: the 
 def sha16(p): return hashlib.sha256(open(p, 'rb').read()).hexdigest()[:16]
 
 def tools_now():
-    """Actual tool fingerprints: translator dll (including the Ryujinx shader library), spirv-cross, metal compiler (macOS / iOS)"""
+    """Actual tool fingerprints: translator dll (including the Ryujinx shader library) and its source sha
+    (however this platform runs it: the Mach-O launcher, or the same dll through dotnet), spirv-cross (the
+    committed build of this platform, its own lock key), the Metal compilers (the Mac only: the Metal
+    steps are the iOS side's; an Android build's shaders stop at SPIR-V and run on Linux and in WSL too)"""
     t = {}
     for dll in ('dmsh_xlate.dll', 'Ryujinx.Graphics.Shader.dll', 'Ryujinx.Common.dll'): t[dll] = sha16(os.path.join(XLATE_DIR, dll))
-    t['xlate_source'] = subprocess.run([os.path.join(XLATE_DIR, 'dmsh_xlate'), '--source-sha'], capture_output=True, text=True).stdout.strip()
-    sc = shutil.which(SPIRV_CROSS)
-    t['spirv-cross'] = sha16(sc) if sc else 'missing'
-    for sdk in ('macosx', 'iphoneos'):
-        t['metal_' + sdk] = subprocess.run(['xcrun', '-sdk', sdk, 'metal', '--version'], capture_output=True, text=True).stdout.splitlines()[0:1] or ['missing']
-        t['metal_' + sdk] = t['metal_' + sdk][0]
+    t['xlate_source'] = subprocess.run(xlate_command(os.path.join(XLATE_DIR, 'dmsh_xlate')) + ['--source-sha'], capture_output=True, text=True, timeout=300).stdout.strip()
+    sc = shutil.which(spirv_cross_path())
+    t[spirv_cross_name() or 'spirv-cross'] = sha16(sc) if sc else 'missing'
+    if sys.platform == 'darwin':
+        for sdk in ('macosx', 'iphoneos'):
+            t['metal_' + sdk] = subprocess.run(['xcrun', '-sdk', sdk, 'metal', '--version'], capture_output=True, text=True).stdout.splitlines()[0:1] or ['missing']
+            t['metal_' + sdk] = t['metal_' + sdk][0]
     return t
 
 def xlate_source_sha():   # same convention as dmsh_xlate --source-sha: the embedded Program.cs and csproj concatenated in that order

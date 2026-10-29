@@ -22,8 +22,8 @@ CHAIN = dmsh_chain.version(); out = os.path.join(out, 'b-' + CHAIN)
 GAME = dmsh_chain.load_game()   # the current game profile (DM_GAME): the tables come from here
 if f'"{CHAIN}"' not in open(dmsh_chain.HEADER).read(): sys.exit(f'[RED] {dmsh_chain.HEADER} does not hold the current translation chain version {CHAIN}: run dmsh_chain.py --header first and commit it (otherwise the host cannot find these libraries)')
 INPUTS = dmsh_chain.inputs(GAME)   # the digest of the profile's inputs, which a full build stamps on its libraries (b-<V>/inputs.tsv)
-XLATE = os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate'))
-SPIRV_CROSS = dmsh_chain.SPIRV_CROSS   # the in-repo build the lock records
+XLATE = dmsh_chain.xlate_command(os.environ.get('XLATE', os.path.join(dmsh_chain.XLATE_DIR, 'dmsh_xlate')))   # the launcher, or the same dll through dotnet (Linux / Windows)
+SPIRV_CROSS = dmsh_chain.spirv_cross_path()   # the in-repo build the lock records (the Mac's, or the x86_64 Linux one beside it)
 FACTS = dmsh_facts.load()
 if not os.path.exists(dmsh_facts.TABLE): sys.exit(f'[RED] no answer table {dmsh_facts.TABLE} (it comes with the game profile; an empty table = every query answered with defaults)')
 IOSOUT = os.environ.get('IOSOUT')   # if set, also build the iOS version (iphoneos metallib + reflection) into that directory

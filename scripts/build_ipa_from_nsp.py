@@ -860,7 +860,7 @@ def check_prereqs(env, xlate, mac=False, android=False):   # mac: a Mac-only bui
         mtl = subprocess.run(['xcrun', '-sdk', 'macosx' if mac else 'iphoneos', 'metal', '--version'], capture_output=True, text=True, env=env)   # Xcode 26 and later install the Metal toolchain separately
         if mtl.returncode: raise BuildError(f'the Metal compiler does not run ({(mtl.stderr.strip().splitlines() or ["no output"])[-1]}): install it with xcodebuild -downloadComponent MetalToolchain')
     if not xlate.exists(): raise BuildError(f'the shader translator is missing from the repository: {xlate}')
-    sc = env.get('SPIRV_CROSS', str(xlate.parent.parent / 'spirv_cross_bin/spirv-cross'))
+    sc = env.get('SPIRV_CROSS') or str(xlate.parent.parent / 'spirv_cross_bin' / ('spirv-cross' if sys.platform == 'darwin' else 'spirv-cross-linux-x86_64'))   # the committed build this platform runs, as spirv_cross_default picks
     if not shutil.which(sc, path=env.get('PATH')): raise BuildError(f'spirv-cross is missing or not executable: {sc}')
 
 
@@ -1513,9 +1513,13 @@ class ShaderWatch:
                 'note': f'{ext[".bin"]:,} not cached' if ext['.bin'] else ''}
 
 
+def spirv_cross_default(repo):   # the committed build this platform runs (dmsh_chain.py picks the same one): the universal Mach-O on the Mac, the x86_64 Linux build beside it
+    return repo / 'dm/gfx/tools/spirv_cross_bin' / ('spirv-cross' if sys.platform == 'darwin' else 'spirv-cross-linux-x86_64')
+
+
 def spirv_cross(repo, env=None):   # resolve the same selection the shader tools run, including an executable name on PATH
     env = os.environ if env is None else env
-    selected = env.get('SPIRV_CROSS', str(repo / 'dm/gfx/tools/spirv_cross_bin/spirv-cross'))
+    selected = env.get('SPIRV_CROSS') or str(spirv_cross_default(repo))
     return Path(shutil.which(selected, path=env.get('PATH')) or selected)
 
 
